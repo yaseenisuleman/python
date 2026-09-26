@@ -19,10 +19,9 @@ uv.lock
 .mypy_cache/
 .ruff_cache/
 
-# IDE (the shared VS Code settings are committed)
+# IDE
 .idea/
-.vscode/*
-!.vscode/settings.json
+.vscode/
 *.swp
 *.swo
 
