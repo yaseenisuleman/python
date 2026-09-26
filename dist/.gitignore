@@ -1,0 +1,2 @@
+# Built wheels in this folder are committed on purpose (Kestra hosts clone this repo).
+# This file stops uv from creating its own ".gitignore" containing "*" here.

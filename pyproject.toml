@@ -1,0 +1,8 @@
+# Workspace root for the python-libs solution.
+# This is a virtual root (no [project] table) — it only groups the libraries.
+# To add a library: create its folder with its own pyproject.toml and list it below.
+
+[tool.uv.workspace]
+members = [
+    "pytoolkit",
+]

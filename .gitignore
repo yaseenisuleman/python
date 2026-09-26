@@ -1,0 +1,36 @@
+# Build output
+# Only the root dist/ is committed (Kestra hosts install wheels from it).
+# Each library's own dist/ folder is ignored.
+*/dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments / tooling
+.venv/
+venv/
+env/
+uv.lock
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE (the shared VS Code settings are committed)
+.idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Local / secrets
+.env
+.env.*
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
