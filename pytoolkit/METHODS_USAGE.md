@@ -271,12 +271,16 @@ config = JsonTools.validate_object(
     name="config",
     required_keys=["capture_name", "database_name"],
 )
+
+updated = JsonTools.set_key(config, "database_name", "OtherDb")   # replaces existing value
+updated = JsonTools.set_key(updated, "batch_size", 500)           # adds missing key
 ```
 
 | Method | Notes |
 |--------|-------|
 | `validate_object(value, *, name="config", required_keys=None)` | Parses a JSON string, checks it is an object with the required keys. Raises `JsonValidationError` (a `ValueError`) |
 | `validate_object_or_fail(value, *, name="config", required_keys=None)` | Same, but exits the process with a one-line error instead of a traceback — use in Kestra scripts |
+| `set_key(value, key, new_value, *, name="config")` | Accepts a JSON string or dict. Replaces the key's value if present, otherwise adds it; other keys are untouched. Only top-level keys are matched. A `new_value` string starting with `{` or `[` is parsed into an object/array; other strings stay strings. Returns a new dict (input dict is not mutated). Raises `JsonValidationError` for invalid JSON |
 
 ### logging.py — `ToolkitLogger`
 

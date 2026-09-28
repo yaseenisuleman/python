@@ -62,3 +62,34 @@ class JsonTools:
             )
         except JsonValidationError as exc:
             sys.exit(str(exc))
+
+    @staticmethod
+    def set_key(
+        value: str | dict[str, Any],
+        key: str,
+        new_value: Any,
+        *,
+        name: str = "config",
+    ) -> dict[str, Any]:
+        """Replace a top-level key's value, or add the key if missing; return the full object.
+
+        ``value`` may be a JSON string or a dict. A dict input is copied, not mutated.
+        A ``new_value`` string that looks like a JSON object or array (starts with
+        ``{`` or ``[``) is parsed and stored as that object; other strings are kept as-is.
+        """
+        if isinstance(value, dict):
+            obj = dict(value)
+        else:
+            obj = JsonTools.validate_object(value, name=name)
+
+        if isinstance(new_value, str) and new_value.lstrip().startswith(("{", "[")):
+            try:
+                new_value = json.loads(new_value)
+            except json.JSONDecodeError as exc:
+                raise JsonValidationError(
+                    f"{name} value for '{key}' is not valid JSON "
+                    f"(line {exc.lineno}, column {exc.colno}): {exc.msg}"
+                ) from None
+
+        obj[key] = new_value
+        return obj
