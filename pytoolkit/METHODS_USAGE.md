@@ -10,7 +10,7 @@ src/python_toolkit/
 ├── cdc/          mssql.py                        (extra: cdc)
 ├── common/       dates.py, json.py, logging.py, validation.py
 ├── parquet/      writer.py                       (extra: parquet)
-├── sqlserver/    sqlserver.py                    (extra: sqlserver)
+├── sqlserver/    sqlserver.py, transfer.py       (extra: sqlserver)
 └── storage/      object_store.py
 ```
 
@@ -384,8 +384,35 @@ for batch in SqlServer.iter_batches(range(10), 4):
 | `fetch_in_batches(connection_or_cursor, sql, *, batch_size=1000, params=None)` | Yields lists of dicts |
 | `iter_batches(items, batch_size)` | Yields lists of up to `batch_size` items |
 | `build_merge_sql(*, target_table, source_table, key_columns, update_columns, insert_columns=None)` | Returns a T-SQL `MERGE` string; `insert_columns` defaults to `update_columns` |
+| `to_odbc_connection_string(conn_str)` | Returns ODBC strings unchanged; converts `server=;port=;user=;password=;database=` strings to ODBC |
+| `validate_table_name(table_name, name="table_name")` | Allows letters, numbers, `_`, `.`, spaces and `[ ]`; raises `ValueError` otherwise |
 
 Methods that take `connection_or_cursor` accept either; a cursor they create themselves is closed afterwards.
+
+### transfer.py — `SqlServerTransfer`
+
+Moves data between SQL Server databases, using `SqlServer.connect` (same `pyodbc` requirement).
+
+```python
+from python_toolkit.sqlserver.transfer import SqlServerTransfer
+
+# Run a stored procedure on one database and load its rows into a table on another.
+result = SqlServerTransfer.sql_sp_to_sql_table(
+    "{{ envs.sql_conn_atm }}",          # source
+    "{{ envs.sql_conn_staging }}",      # destination
+    "EXEC [DW].[GetLoadInformation] NULL, NULL",
+    "[ATM].[TerminalLoads]",
+    process_guid="{{ inputs.process_guid }}",   # empty → a new UUID
+)
+# {"destination_table": "[ATM].[TerminalLoads]", "row_count": 1234,
+#  "process_guid": "...", "timestamp": "2026-10-14T09:30:00+00:00"}
+```
+
+| Method | Notes |
+|--------|-------|
+| `sql_sp_to_sql_table(source_conn_str, destination_conn_str, sql_query, destination_table, *, process_guid=None, batch_size=1000)` | Returns `destination_table`, `row_count`, `process_guid`, `timestamp` |
+
+`sql_sp_to_sql_table` appends two columns to every row — the UTC load time, then `process_guid` — and inserts by position, so the destination table's columns must be the result set's columns followed by those two. Rows are streamed in batches of `batch_size` and committed in one transaction. Connection strings can be ODBC strings or `server=<host>;port=1433;user=<user>;password=<password>;database=<db>`.
 
 ---
 
@@ -427,4 +454,5 @@ Keys that resolve outside the store folder (e.g. `../x`) raise `ValueError`.
 | `python_toolkit.common.validation` | `Validation` | — |
 | `python_toolkit.parquet.writer` | `ParquetWriter` | `parquet` |
 | `python_toolkit.sqlserver.sqlserver` | `SqlServer` | `sqlserver` |
+| `python_toolkit.sqlserver.transfer` | `SqlServerTransfer` | `sqlserver` |
 | `python_toolkit.storage.object_store` | `LocalObjectStore` | — |

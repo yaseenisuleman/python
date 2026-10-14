@@ -7,12 +7,15 @@ Kestra usage::
 
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 from typing import Any, Generator, Iterable, Optional, Sequence, TypeVar
 
 from python_toolkit.common.validation import Validation
 
 T = TypeVar("T")
+
+_TABLE_NAME_RE = re.compile(r"^[A-Za-z0-9_.\[\] ]+$")
 
 
 class SqlServer:
@@ -51,6 +54,42 @@ class SqlServer:
             parts.append(extra)
 
         return ";".join(parts)
+
+    @staticmethod
+    def to_odbc_connection_string(conn_str: str) -> str:
+        """Pass ODBC strings through; convert ``server=;port=;user=;password=;database=`` ones."""
+        Validation.require_non_empty(conn_str, "conn_str")
+
+        parts: dict[str, str] = {}
+        for segment in conn_str.split(";"):
+            if "=" in segment:
+                key, value = segment.split("=", 1)
+                parts[key.strip().lower()] = value.strip()
+
+        if "driver" in parts:
+            return conn_str
+
+        server = parts.get("server") or parts.get("host") or parts.get("data source") or ""
+        if parts.get("port"):
+            server = f"{server},{parts['port']}"
+
+        return SqlServer.connection_string(
+            server=server,
+            database=parts.get("database") or parts.get("initial catalog") or "",
+            username=parts.get("user") or parts.get("uid"),
+            password=parts.get("password") or parts.get("pwd"),
+        )
+
+    @staticmethod
+    def validate_table_name(table_name: str, name: str = "table_name") -> str:
+        """Validate a table name before it is placed into SQL text."""
+        table_name = Validation.require_non_empty(table_name, name)
+        if not _TABLE_NAME_RE.fullmatch(table_name):
+            raise ValueError(
+                f"{name} must contain only letters, numbers, underscores, "
+                "dots, spaces, and square brackets"
+            )
+        return table_name
 
     @staticmethod
     @contextmanager
