@@ -8,7 +8,9 @@ Kestra usage::
 from __future__ import annotations
 
 import uuid
-from typing import Any, Optional
+from datetime import date, datetime, time
+from decimal import Decimal
+from typing import Any, Optional, Sequence
 
 from python_toolkit.common.dates import Dates
 from python_toolkit.common.logging import ToolkitLogger
@@ -17,6 +19,17 @@ from python_toolkit.sqlserver.sqlserver import SqlServer
 
 # SQL Server allows at most 1000 rows in one INSERT ... VALUES statement.
 _MAX_ROWS_PER_INSERT = 1000
+
+
+def _json_value(value: Any) -> Any:
+    """Convert a SQL value to a JSON-friendly Python value."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "0x" + bytes(value).hex()
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
+    if isinstance(value, (Decimal, uuid.UUID)):
+        return str(value)
+    return value
 
 
 class SqlServerTransfer:
@@ -86,5 +99,59 @@ class SqlServerTransfer:
             "destination_table": destination_table,
             "row_count": row_count,
             "process_guid": process_guid,
+            "timestamp": Dates.utc_now().isoformat(),
+        }
+
+    @staticmethod
+    def sql_sp_to_json(
+        conn_str: str,
+        sql_query: str,
+        *,
+        params: Optional[Sequence[Any]] = None,
+    ) -> dict[str, Any]:
+        """Run a stored procedure (or query) and return its rows as JSON-ready records.
+
+        Each record is a dict keyed by the result set's column names. Dates and times
+        become ISO 8601 strings, ``Decimal`` and ``uniqueidentifier`` values become
+        strings, and binary values become ``0x`` hex strings. Only the first result set
+        is read. ``params`` fill ``%s`` placeholders in ``sql_query``.
+        """
+        Validation.require_non_empty(sql_query, "sql_query")
+        logger = ToolkitLogger.get_logger("SqlServerTransfer")
+
+        with SqlServer.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            try:
+                if params:
+                    cursor.execute(sql_query, tuple(params))
+                else:
+                    cursor.execute(sql_query)
+                if not cursor.description:
+                    raise ValueError(
+                        "sql_query did not return a result set "
+                        "(for a stored procedure, add SET NOCOUNT ON)"
+                    )
+
+                columns = [column[0] for column in cursor.description]
+                unnamed = [str(index + 1) for index, column in enumerate(columns) if not column]
+                if unnamed:
+                    raise ValueError(f"Result set columns {', '.join(unnamed)} have no name; alias them in sql_query")
+                duplicates = sorted({column for column in columns if columns.count(column) > 1})
+                if duplicates:
+                    raise ValueError(f"Result set has duplicate column names: {', '.join(duplicates)}")
+
+                records = [
+                    {column: _json_value(value) for column, value in zip(columns, row)}
+                    for row in cursor.fetchall()
+                ]
+            finally:
+                cursor.close()
+
+        logger.info(f"Fetched {len(records)} records")
+
+        return {
+            "records": records,
+            "row_count": len(records),
+            "columns": columns,
             "timestamp": Dates.utc_now().isoformat(),
         }

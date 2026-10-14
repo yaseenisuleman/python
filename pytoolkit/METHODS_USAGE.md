@@ -408,13 +408,25 @@ result = SqlServerTransfer.sql_sp_to_sql_table(
 )
 # {"destination_table": "[ATM].[TerminalLoads]", "row_count": 1234,
 #  "process_guid": "...", "timestamp": "2026-10-14T09:30:00+00:00"}
+
+# Run a stored procedure and get its rows back as JSON records keyed by column name.
+result = SqlServerTransfer.sql_sp_to_json(
+    "{{ envs.sql_conn_atm }}",
+    "EXEC [DW].[GetLoadInformation] %s, NULL",
+    params=[load_date],   # optional; fills the %s placeholders
+)
+# {"records": [{"TerminalId": "T001", "LoadDate": "2026-10-14T18:00:00", ...}],
+#  "row_count": 1, "columns": ["TerminalId", "LoadDate", ...], "timestamp": "..."}
 ```
 
 | Method | Notes |
 |--------|-------|
 | `sql_sp_to_sql_table(source_conn_str, destination_conn_str, sql_query, destination_table, *, process_guid=None, batch_size=1000)` | Returns `destination_table`, `row_count`, `process_guid`, `timestamp` |
+| `sql_sp_to_json(conn_str, sql_query, *, params=None)` | Returns `records`, `row_count`, `columns`, `timestamp` |
 
 `sql_sp_to_sql_table` appends two columns to every row — the UTC load time, then `process_guid` — and inserts by position, so the destination table's columns must be the result set's columns followed by those two. Rows are streamed in batches of `batch_size`, inserted with multi-row `INSERT ... VALUES` statements of up to 1000 rows, and committed in one transaction. Connection strings can be `server=<host>;port=1433;user=<user>;password=<password>;database=<db>` or ODBC-style strings (see `connection_kwargs`). Datetime values are sent with millisecond precision.
+
+`sql_sp_to_json` reads the first result set into memory and returns each row as a dict keyed by column name. Values are made JSON-safe: dates and times become ISO 8601 strings, `Decimal` and `uniqueidentifier` values become strings, and binary values become `0x` hex strings. It raises `ValueError` if the query returns no result set (add `SET NOCOUNT ON` to stored procedures), or if any column is unnamed or duplicated — alias those columns in the query.
 
 ---
 
