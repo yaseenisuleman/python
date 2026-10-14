@@ -340,7 +340,7 @@ The output directory must already exist.
 
 ### sqlserver.py — `SqlServer`
 
-General SQL Server helpers using `pyodbc` (requires an installed ODBC driver). For CDC, use `MssqlCdc` instead.
+General SQL Server helpers using `pymssql` (no ODBC driver needed). For CDC, use `MssqlCdc` instead.
 
 ```python
 from python_toolkit.sqlserver.sqlserver import SqlServer
@@ -350,15 +350,17 @@ conn_str = SqlServer.connection_string(
     database="MyDb",
     username="<user>",      # omit username/password for Windows auth
     password="<password>",
+    port=1433,              # optional
 )
+# "server=<host>;port=1433;user=<user>;password=<password>;database=MyDb"
 
 with SqlServer.connect(conn_str) as conn:
-    rows = SqlServer.fetch_all(conn, "SELECT Id, Name FROM dbo.Items WHERE Status = ?", ["Active"])
+    rows = SqlServer.fetch_all(conn, "SELECT Id, Name FROM dbo.Items WHERE Status = %s", ["Active"])
 
     for batch in SqlServer.fetch_in_batches(conn, "SELECT * FROM dbo.BigTable", batch_size=1000):
         print(len(batch))
 
-    SqlServer.execute(conn, "UPDATE dbo.Items SET Status = ? WHERE Id = ?", ["Done", 42])
+    SqlServer.execute(conn, "UPDATE dbo.Items SET Status = %s WHERE Id = %s", ["Done", 42])
     conn.commit()
 
 # Build an upsert statement.
@@ -377,21 +379,21 @@ for batch in SqlServer.iter_batches(range(10), 4):
 
 | Method | Notes |
 |--------|-------|
-| `connection_string(*, server, database, username=None, password=None, driver="ODBC Driver 18 for SQL Server", trust_server_certificate=True, extra=None)` | Uses `Trusted_Connection=yes` when no username/password is given |
-| `connect(conn_str, **kwargs)` | Context manager; closes the connection on exit. Does not commit |
+| `connection_string(*, server, database, username=None, password=None, port=None)` | Returns `server=;port=;user=;password=;database=`. Without username/password, pymssql uses integrated (Windows/Kerberos) auth |
+| `connection_kwargs(conn_str)` | Parses a `server=;port=;user=;password=;database=` or ODBC-style (`SERVER=host,port;UID=;PWD=;DATABASE=`) string into `pymssql.connect` arguments |
+| `connect(conn_str, **kwargs)` | Context manager; closes the connection on exit. Does not commit. `kwargs` go to `pymssql.connect` and override the string |
 | `execute(connection_or_cursor, sql, params=None)` | Runs a statement |
 | `fetch_all(connection_or_cursor, sql, params=None)` | Returns rows as a list of dicts |
 | `fetch_in_batches(connection_or_cursor, sql, *, batch_size=1000, params=None)` | Yields lists of dicts |
 | `iter_batches(items, batch_size)` | Yields lists of up to `batch_size` items |
 | `build_merge_sql(*, target_table, source_table, key_columns, update_columns, insert_columns=None)` | Returns a T-SQL `MERGE` string; `insert_columns` defaults to `update_columns` |
-| `to_odbc_connection_string(conn_str)` | Returns ODBC strings unchanged; converts `server=;port=;user=;password=;database=` strings to ODBC |
 | `validate_table_name(table_name, name="table_name")` | Allows letters, numbers, `_`, `.`, spaces and `[ ]`; raises `ValueError` otherwise |
 
-Methods that take `connection_or_cursor` accept either; a cursor they create themselves is closed afterwards.
+Methods that take `connection_or_cursor` accept either; a cursor they create themselves is closed afterwards. Query parameters use pymssql's `%s` placeholders (not `?`); when `params` are passed, write a literal `%` in the SQL as `%%`.
 
 ### transfer.py — `SqlServerTransfer`
 
-Moves data between SQL Server databases, using `SqlServer.connect` (same `pyodbc` requirement).
+Moves data between SQL Server databases, using `SqlServer.connect` (same `pymssql` requirement).
 
 ```python
 from python_toolkit.sqlserver.transfer import SqlServerTransfer
@@ -412,7 +414,7 @@ result = SqlServerTransfer.sql_sp_to_sql_table(
 |--------|-------|
 | `sql_sp_to_sql_table(source_conn_str, destination_conn_str, sql_query, destination_table, *, process_guid=None, batch_size=1000)` | Returns `destination_table`, `row_count`, `process_guid`, `timestamp` |
 
-`sql_sp_to_sql_table` appends two columns to every row — the UTC load time, then `process_guid` — and inserts by position, so the destination table's columns must be the result set's columns followed by those two. Rows are streamed in batches of `batch_size` and committed in one transaction. Connection strings can be ODBC strings or `server=<host>;port=1433;user=<user>;password=<password>;database=<db>`.
+`sql_sp_to_sql_table` appends two columns to every row — the UTC load time, then `process_guid` — and inserts by position, so the destination table's columns must be the result set's columns followed by those two. Rows are streamed in batches of `batch_size`, inserted with multi-row `INSERT ... VALUES` statements of up to 1000 rows, and committed in one transaction. Connection strings can be `server=<host>;port=1433;user=<user>;password=<password>;database=<db>` or ODBC-style strings (see `connection_kwargs`). Datetime values are sent with millisecond precision.
 
 ---
 

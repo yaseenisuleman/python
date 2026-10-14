@@ -28,36 +28,29 @@ class SqlServer:
         database: str,
         username: Optional[str] = None,
         password: Optional[str] = None,
-        driver: str = "ODBC Driver 18 for SQL Server",
-        trust_server_certificate: bool = True,
-        extra: Optional[str] = None,
+        port: Optional[int] = None,
     ) -> str:
-        """Build a pyodbc connection string."""
+        """Build a ``server=;port=;user=;password=;database=`` connection string."""
         Validation.require_non_empty(server, "server")
         Validation.require_non_empty(database, "database")
 
-        parts = [
-            f"DRIVER={{{driver}}}",
-            f"SERVER={server}",
-            f"DATABASE={database}",
-        ]
-
+        parts = [f"server={server}"]
+        if port:
+            parts.append(f"port={port}")
         if username and password:
-            parts.extend([f"UID={username}", f"PWD={password}"])
-        else:
-            parts.append("Trusted_Connection=yes")
-
-        if trust_server_certificate:
-            parts.append("TrustServerCertificate=yes")
-
-        if extra:
-            parts.append(extra)
+            parts.extend([f"user={username}", f"password={password}"])
+        parts.append(f"database={database}")
 
         return ";".join(parts)
 
     @staticmethod
-    def to_odbc_connection_string(conn_str: str) -> str:
-        """Pass ODBC strings through; convert ``server=;port=;user=;password=;database=`` ones."""
+    def connection_kwargs(conn_str: str) -> dict[str, Any]:
+        """Parse a connection string into ``pymssql.connect`` keyword arguments.
+
+        Accepts ``server=;port=;user=;password=;database=`` strings and ODBC-style
+        ``SERVER=host,port;UID=;PWD=;DATABASE=`` strings (``DRIVER`` and other keys are ignored).
+        Without a user, pymssql uses integrated (Windows/Kerberos) authentication.
+        """
         Validation.require_non_empty(conn_str, "conn_str")
 
         parts: dict[str, str] = {}
@@ -66,19 +59,24 @@ class SqlServer:
                 key, value = segment.split("=", 1)
                 parts[key.strip().lower()] = value.strip()
 
-        if "driver" in parts:
-            return conn_str
-
         server = parts.get("server") or parts.get("host") or parts.get("data source") or ""
-        if parts.get("port"):
-            server = f"{server},{parts['port']}"
+        server = Validation.require_non_empty(server.removeprefix("tcp:"), "server")
+        port = parts.get("port")
+        if "," in server:
+            server, port = (value.strip() for value in server.split(",", 1))
 
-        return SqlServer.connection_string(
-            server=server,
-            database=parts.get("database") or parts.get("initial catalog") or "",
-            username=parts.get("user") or parts.get("uid"),
-            password=parts.get("password") or parts.get("pwd"),
-        )
+        kwargs: dict[str, Any] = {"server": server}
+        if port:
+            kwargs["port"] = port
+        user = parts.get("user") or parts.get("uid")
+        if user:
+            kwargs["user"] = user
+            kwargs["password"] = parts.get("password") or parts.get("pwd") or ""
+        database = parts.get("database") or parts.get("initial catalog")
+        if database:
+            kwargs["database"] = database
+
+        return kwargs
 
     @staticmethod
     def validate_table_name(table_name: str, name: str = "table_name") -> str:
@@ -94,9 +92,12 @@ class SqlServer:
     @staticmethod
     @contextmanager
     def connect(conn_str: str, **kwargs: Any) -> Generator[Any, None, None]:
-        """Open a pyodbc connection as a context manager."""
-        pyodbc = SqlServer._load_pyodbc()
-        conn = pyodbc.connect(conn_str, **kwargs)
+        """Open a pymssql connection as a context manager.
+
+        ``kwargs`` are passed to ``pymssql.connect`` and override values from ``conn_str``.
+        """
+        pymssql = SqlServer._load_pymssql()
+        conn = pymssql.connect(**{**SqlServer.connection_kwargs(conn_str), **kwargs})
         try:
             yield conn
         finally:
@@ -223,17 +224,17 @@ WHEN NOT MATCHED THEN
     ) -> None:
         """Execute SQL on an already-owned cursor."""
         if params:
-            cursor.execute(sql, params)
+            cursor.execute(sql, tuple(params))
         else:
             cursor.execute(sql)
 
     @staticmethod
-    def _load_pyodbc() -> Any:
-        """Load the optional pyodbc dependency only when a connection is opened."""
+    def _load_pymssql() -> Any:
+        """Load the optional pymssql dependency only when a connection is opened."""
         try:
-            import pyodbc
+            import pymssql
         except ImportError as exc:
             raise ImportError(
-                "pyodbc is required for SQL Server support. Install with: pip install pyodbc"
+                "pymssql is required for SQL Server support. Install with: pip install pymssql"
             ) from exc
-        return pyodbc
+        return pymssql

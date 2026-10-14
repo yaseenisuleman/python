@@ -14,7 +14,7 @@ dependencies = []
 api = ["requests"]
 cdc = ["pymssql"]
 parquet = ["pyarrow"]
-sqlserver = ["pyodbc"]
+sqlserver = ["pymssql"]
 all = ["pytoolkit-package[api,cdc,parquet,sqlserver]"]
 
 [tool.hatch.version]
