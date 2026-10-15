@@ -28,7 +28,7 @@ Core helpers have no third-party dependencies. Pick extras for the stacks you us
 
 | Extra | Installs | Needed for |
 |-------|----------|------------|
-| `api` | `requests` | `api.client`, `api.dynamics_crm` |
+| `api` | `requests` | `api.client`, `api.dynamics_crm`, `api.openobserve` |
 | `cdc` | `pymssql` | `cdc.mssql` |
 | `parquet` | `pyarrow` | `parquet.writer` |
 | `sqlserver` | `pymssql` | `sqlserver.sqlserver` (`connect`), `sqlserver.transfer` |

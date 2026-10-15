@@ -6,7 +6,8 @@ How to call the public methods in the `python_toolkit` package. Signatures and r
 
 ```text
 src/python_toolkit/
-├── api/          client.py, dynamics_crm.py      (extra: api)
+├── api/          client.py, dynamics_crm.py,     (extra: api)
+│                 openobserve.py
 ├── cdc/          mssql.py                        (extra: cdc)
 ├── common/       dates.py, json.py, logging.py, validation.py
 ├── parquet/      writer.py                       (extra: parquet)
@@ -148,6 +149,37 @@ Public methods — all accept keyword-only `timeout=30.0` and `session=None`:
 | `error_count` | Records that failed |
 | `status_code` | `200` if all succeeded, `207` if any failed |
 | `errors` | List of `{entity_id, field_values, status_code, message}` — `message` is the short Microsoft error text |
+
+### openobserve.py — `OpenObserve`
+
+Sends an execution event to an OpenObserve stream (`{base_url}/api/{organization}/{stream}/_json`), with basic auth. In Kestra, call it from an `afterExecution` Python task so the log is part of the flow's own execution.
+
+```python
+from python_toolkit.api.openobserve import OpenObserve
+
+result = OpenObserve.log_execution(
+    {"event_type": "afterExecution", "status": "{{ execution.state }}",
+     "started_at": "{{ execution.startDate }}", "metadata": {"row_count": 7}},
+    "{{ envs.openobserve_url }}",
+    "{{ envs.openobserve_user }}",
+    "{{ envs.openobserve_password }}",
+    execution_id="{{ execution.id }}",
+    flow_id="{{ flow.id }}",
+    namespace="{{ flow.namespace }}",
+)
+# {"stream": "kestra_executions", "status_code": 200, "payload": {...}}
+```
+
+| Method | Returns |
+|--------|---------|
+| `log_execution(event, base_url, username, password, *, execution_id="", flow_id="", namespace="", instance_name="production", event_name="kestra_execution", organization="default", stream="kestra_executions", verify_ssl=False, timeout=2.0, session=None)` | `stream`, `status_code`, `payload` |
+
+- `event` is a JSON string or dict. `started_at` (ISO 8601) is required; `event_type`, `status` and `metadata` are optional.
+- `status` sets `severity`: `SUCCESS` → `success`, `FAILED` → `error`, `WARNING` → `warning`, anything else → `info`.
+- `started_at` and `ended_at` (now) are sent as local times without a timezone, plus `duration_seconds`.
+- `metadata` (dict or JSON string) is sent as an indented JSON string.
+- `event_name`, `stream` and `instance_name` let it log things other than Kestra executions.
+- On any request failure it logs the error and the OpenObserve response body, then re-raises.
 
 ---
 
@@ -473,6 +505,7 @@ Keys that resolve outside the store folder (e.g. `../x`) raise `ValueError`.
 |--------|-------|-------|
 | `python_toolkit.api.client` | `ApiClient` | `api` |
 | `python_toolkit.api.dynamics_crm` | `DynamicsCrmClient` | `api` |
+| `python_toolkit.api.openobserve` | `OpenObserve` | `api` |
 | `python_toolkit.cdc.mssql` | `MssqlCdc` | `cdc` |
 | `python_toolkit.common.dates` | `Dates` | — |
 | `python_toolkit.common.json` | `JsonTools` | — |
