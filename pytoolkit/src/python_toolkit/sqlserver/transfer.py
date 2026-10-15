@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 
 from python_toolkit.common.dates import Dates
 from python_toolkit.common.logging import ToolkitLogger
@@ -30,6 +30,13 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, (Decimal, uuid.UUID)):
         return str(value)
     return value
+
+
+def _param_values(params: Any) -> tuple[Any, ...]:
+    """Turn ``params`` into a tuple: a list or tuple as-is, any other value as one parameter."""
+    if params is None or isinstance(params, (list, tuple)):
+        return tuple(params or ())
+    return (params,)
 
 
 class SqlServerTransfer:
@@ -107,31 +114,134 @@ class SqlServerTransfer:
         conn_str: str,
         sql_query: str,
         *,
-        params: Optional[Sequence[Any]] = None,
+        params: Optional[Any] = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         """Run a stored procedure (or query) and return its rows as JSON-ready records.
 
         Each record is a dict keyed by the result set's column names. Dates and times
         become ISO 8601 strings, ``Decimal`` and ``uniqueidentifier`` values become
         strings, and binary values become ``0x`` hex strings. Only the first result set
-        is read. ``params`` fill ``%s`` placeholders in ``sql_query``.
+        is returned. ``params`` fill ``%s`` placeholders in ``sql_query``: pass a list or
+        tuple, or a single value for one placeholder. With ``commit`` (the default),
+        changes made by the procedure are committed once it has finished without error;
+        with ``commit=False`` they are rolled back.
         """
         Validation.require_non_empty(sql_query, "sql_query")
         logger = ToolkitLogger.get_logger("SqlServerTransfer")
 
         with SqlServer.connect(conn_str) as conn:
-            cursor = conn.cursor()
-            try:
-                if params:
-                    cursor.execute(sql_query, tuple(params))
-                else:
-                    cursor.execute(sql_query)
-                if not cursor.description:
-                    raise ValueError(
-                        "sql_query did not return a result set "
-                        "(for a stored procedure, add SET NOCOUNT ON)"
-                    )
+            columns, records, _ = SqlServerTransfer._run_sql(conn, sql_query, params, fetch=True)
+            if columns is None:
+                raise ValueError(
+                    "sql_query did not return a result set "
+                    "(for a stored procedure, add SET NOCOUNT ON)"
+                )
+            if commit:
+                conn.commit()
 
+        logger.info(f"Fetched {len(records)} records")
+
+        return {
+            "records": records,
+            "row_count": len(records),
+            "columns": columns,
+            "timestamp": Dates.utc_now().isoformat(),
+        }
+
+    @staticmethod
+    def sql_sp_execute(
+        conn_str: str,
+        sql_query: str,
+        *,
+        params: Optional[Any] = None,
+        return_results: bool = False,
+        commit: bool = True,
+        raise_on_error: bool = True,
+    ) -> dict[str, Any]:
+        """Run a stored procedure (or any SQL) and report whether it succeeded.
+
+        The procedure is read to the end, so an error raised after earlier statements
+        still counts as a failure, and nothing is committed unless it finishes without
+        error. ``params`` fill ``%s`` placeholders in ``sql_query`` (a list or tuple, or a
+        single value). With ``return_results``, the first result set is returned as
+        JSON-ready ``records`` (as in ``sql_sp_to_json``); a procedure with no result
+        set gives empty ``records``. With ``commit=False`` changes are rolled back.
+
+        Returns ``success``, ``sql_query``, ``rows_affected``, ``duration_seconds`` and
+        ``timestamp``. ``rows_affected`` is the count SQL Server reports for the call, or
+        ``None`` when it reports none (e.g. a procedure that uses ``SET NOCOUNT ON``).
+
+        On failure the error is raised, or with ``raise_on_error=False`` returned as
+        ``{"success": False, "error": ...}`` after the changes are rolled back.
+        """
+        Validation.require_non_empty(sql_query, "sql_query")
+        logger = ToolkitLogger.get_logger("SqlServerTransfer")
+        started_at = Dates.utc_now()
+
+        try:
+            with SqlServer.connect(conn_str) as conn:
+                columns, records, rows_affected = SqlServerTransfer._run_sql(
+                    conn, sql_query, params, fetch=return_results
+                )
+                if commit:
+                    conn.commit()
+        except Exception as exc:
+            if raise_on_error:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+            logger.error(f"SQL failed: {error}")
+            return {
+                "success": False,
+                "sql_query": sql_query,
+                "error": error,
+                "rows_affected": None,
+                "duration_seconds": (Dates.utc_now() - started_at).total_seconds(),
+                "timestamp": Dates.utc_now().isoformat(),
+            }
+
+        logger.info(
+            f"SQL executed successfully{' and committed' if commit else ''}; "
+            f"rows affected: {rows_affected if rows_affected is not None else 'not reported'}"
+        )
+
+        result: dict[str, Any] = {
+            "success": True,
+            "sql_query": sql_query,
+            "rows_affected": rows_affected,
+            "duration_seconds": (Dates.utc_now() - started_at).total_seconds(),
+            "timestamp": Dates.utc_now().isoformat(),
+        }
+        if return_results:
+            result.update(records=records, row_count=len(records), columns=columns or [])
+        return result
+
+    @staticmethod
+    def _run_sql(
+        conn: Any,
+        sql_query: str,
+        params: Optional[Any],
+        *,
+        fetch: bool,
+    ) -> tuple[Optional[list[str]], list[dict[str, Any]], Optional[int]]:
+        """Execute SQL and read it to the end.
+
+        Returns the first result set's columns and records, and the rows-affected count
+        the driver reports for the call. ``columns`` is ``None`` when nothing was fetched
+        or there was no result set; the count is ``None`` when none was reported.
+        """
+        cursor = conn.cursor()
+        try:
+            values = _param_values(params)
+            if values:
+                cursor.execute(sql_query, values)
+            else:
+                cursor.execute(sql_query)
+            rows_affected = cursor.rowcount if cursor.rowcount >= 0 else None
+
+            columns = None
+            records: list[dict[str, Any]] = []
+            if fetch and cursor.description:
                 columns = [column[0] for column in cursor.description]
                 unnamed = [str(index + 1) for index, column in enumerate(columns) if not column]
                 if unnamed:
@@ -144,14 +254,11 @@ class SqlServerTransfer:
                     {column: _json_value(value) for column, value in zip(columns, row)}
                     for row in cursor.fetchall()
                 ]
-            finally:
-                cursor.close()
 
-        logger.info(f"Fetched {len(records)} records")
+            # Read to the end so an error raised later in the procedure surfaces before any commit.
+            while cursor.nextset():
+                pass
 
-        return {
-            "records": records,
-            "row_count": len(records),
-            "columns": columns,
-            "timestamp": Dates.utc_now().isoformat(),
-        }
+            return columns, records, rows_affected
+        finally:
+            cursor.close()

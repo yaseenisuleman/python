@@ -413,20 +413,32 @@ result = SqlServerTransfer.sql_sp_to_sql_table(
 result = SqlServerTransfer.sql_sp_to_json(
     "{{ envs.sql_conn_atm }}",
     "EXEC [DW].[GetLoadInformation] %s, NULL",
-    params=[load_date],   # optional; fills the %s placeholders
+    params=[load_date],   # optional; fills the %s placeholders (a single value also works)
 )
 # {"records": [{"TerminalId": "T001", "LoadDate": "2026-10-14T18:00:00", ...}],
 #  "row_count": 1, "columns": ["TerminalId", "LoadDate", ...], "timestamp": "..."}
+
+# Run a procedure that returns nothing (e.g. an upsert) and confirm it succeeded.
+result = SqlServerTransfer.sql_sp_execute(
+    "{{ envs.sql_conn_staging }}",
+    "EXEC [Terminal].[Upsert.CashPosition] %s, 1",
+    params=process_guid,
+)
+# {"success": True, "sql_query": "EXEC [Terminal].[Upsert.CashPosition] %s, 1",
+#  "rows_affected": 42, "duration_seconds": 0.8, "timestamp": "..."}
 ```
 
 | Method | Notes |
 |--------|-------|
 | `sql_sp_to_sql_table(source_conn_str, destination_conn_str, sql_query, destination_table, *, process_guid=None, batch_size=1000)` | Returns `destination_table`, `row_count`, `process_guid`, `timestamp` |
-| `sql_sp_to_json(conn_str, sql_query, *, params=None)` | Returns `records`, `row_count`, `columns`, `timestamp` |
+| `sql_sp_to_json(conn_str, sql_query, *, params=None, commit=True)` | Returns `records`, `row_count`, `columns`, `timestamp` |
+| `sql_sp_execute(conn_str, sql_query, *, params=None, return_results=False, commit=True, raise_on_error=True)` | Returns `success`, `sql_query`, `rows_affected`, `duration_seconds`, `timestamp`; plus `records`, `row_count`, `columns` with `return_results`; `success: False` and `error` on failure with `raise_on_error=False` |
 
 `sql_sp_to_sql_table` appends two columns to every row — the UTC load time, then `process_guid` — and inserts by position, so the destination table's columns must be the result set's columns followed by those two. Rows are streamed in batches of `batch_size`, inserted with multi-row `INSERT ... VALUES` statements of up to 1000 rows, and committed in one transaction. Connection strings can be `server=<host>;port=1433;user=<user>;password=<password>;database=<db>` or ODBC-style strings (see `connection_kwargs`). Datetime values are sent with millisecond precision.
 
-`sql_sp_to_json` reads the first result set into memory and returns each row as a dict keyed by column name. Values are made JSON-safe: dates and times become ISO 8601 strings, `Decimal` and `uniqueidentifier` values become strings, and binary values become `0x` hex strings. It raises `ValueError` if the query returns no result set (add `SET NOCOUNT ON` to stored procedures), or if any column is unnamed or duplicated — alias those columns in the query.
+`sql_sp_execute` is the general way to call a stored procedure. It reads the procedure to the end, so an error raised after earlier statements still fails the call, and it commits only when the whole procedure succeeded. By default it just runs and commits; pass `return_results=True` to also get the first result set as JSON-ready `records` (empty if the procedure returns none). `rows_affected` is the count SQL Server reports for the call, or `null` when it reports none — procedures with `SET NOCOUNT ON` report none, so for a reliable count have the procedure `SELECT @@ROWCOUNT AS RowsAffected` and use `return_results=True`. On failure it raises, or with `raise_on_error=False` rolls back and returns `success: False` with `error` (plus `sql_query`, `duration_seconds`, `timestamp`).
+
+`sql_sp_to_json` reads the first result set into memory and returns each row as a dict keyed by column name. Values are made JSON-safe: dates and times become ISO 8601 strings, `Decimal` and `uniqueidentifier` values become strings, and binary values become `0x` hex strings. By default it commits after fetching, so changes the procedure makes (e.g. marking a batch as taken) are saved; pass `commit=False` to roll them back. It raises `ValueError` if the query returns no result set (add `SET NOCOUNT ON` to stored procedures), or if any column is unnamed or duplicated — alias those columns in the query.
 
 ---
 
