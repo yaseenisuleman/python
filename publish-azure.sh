@@ -2,11 +2,11 @@
 # Builds the wheels and publishes them to the Azure DevOps "Python Packages" repo.
 #   ./publish-azure.sh               # build and publish every library
 #   ./publish-azure.sh pytoolkit     # build and publish one library (folder name)
-# The Azure repo is a separate clone (default: ../python-packages). Override with
+# The Azure repo is a separate clone (default: ../../azure-devops/Python Packages). Override with
 # AZURE_REPO=/path/to/clone ./publish-azure.sh
 set -e
 root="$(cd "$(dirname "$0")" && pwd)"
-azure_repo="${AZURE_REPO:-$root/../python-packages}"
+azure_repo="${AZURE_REPO:-$root/../../azure-devops/Python Packages}"
 azure_url="https://dev.azure.com/paycorpgroup/Data%20Flow%20Ops/_git/Python%20Packages"
 
 if [ ! -d "$azure_repo/.git" ]; then
