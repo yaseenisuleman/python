@@ -147,6 +147,32 @@ jdbc:sqlserver://<host>:1433;databaseName=<database>;encrypt=true;trustServerCer
 
 Read results from the task output: `outputs.get_next_lsn.rows[0].from_lsn`, etc.
 
+### Dynamics CRM in Kestra — read, then update
+
+```python
+from kestra import Kestra
+from python_toolkit.api.dynamics_crm import DynamicsCrmClient
+
+resource = "{{ envs.crm_resource }}"
+token = DynamicsCrmClient.get_access_token(
+    "{{ secret('CRM_TENANT_ID') }}",
+    "{{ secret('CRM_CLIENT_ID') }}",
+    "{{ secret('CRM_CLIENT_SECRET') }}",
+    resource,
+)["access_token"]
+
+result = DynamicsCrmClient.query_entities(
+    resource.rstrip("/"),
+    "accounts",
+    token,
+    select=["accountid", "name"],
+    filter="statecode eq 0",
+)
+Kestra.outputs({"row_count": result["row_count"], "timestamp": result["timestamp"]})
+```
+
+`query_entities` follows `@odata.nextLink` automatically and returns every page in `records`.
+
 ## Classes by module
 
 | Module | Class | Extra |

@@ -11,6 +11,9 @@ Kestra usage::
         "{{ inputs.resource }}",
     )
 
+Reads (``query_entities``) and updates (``update_entity``,
+``bulk_update_entities``) Dataverse records.
+
 Uses the Azure AD v1 OAuth 2.0 client credentials grant
 (``https://login.microsoftonline.com/{tenant_id}/oauth2/token``) against a
 Dynamics ``resource`` URL, e.g. ``https://org.crm.dynamics.com/``.
@@ -18,8 +21,10 @@ Dynamics ``resource`` URL, e.g. ``https://org.crm.dynamics.com/``.
 
 from __future__ import annotations
 from typing import Any, Optional
+from urllib.parse import quote, urlencode
 import requests
 
+from python_toolkit.common.dates import Dates
 from python_toolkit.common.logging import ToolkitLogger
 from python_toolkit.common.validation import Validation
 
@@ -184,6 +189,113 @@ class DynamicsCrmClient:
             "entity_id": resolved_entity_id,
             "updated_fields": list(payload.keys()),
             "status_code": response.status_code,
+        }
+
+    @staticmethod
+    def query_entities(
+        resource_url: str,
+        entity_set_name: str,
+        token: str,
+        *,
+        select: Optional[list[str]] = None,
+        filter: Optional[str] = None,
+        page_size: int = 5000,
+        timeout: float = 30.0,
+        session: Optional[requests.Session] = None,
+    ) -> dict[str, Any]:
+        """Read Dataverse records from an entity set, following every result page.
+
+        Paging is automatic: each response's ``@odata.nextLink`` is followed
+        until Dataverse returns no further link, and all pages are combined.
+
+        Args:
+            resource_url: Dataverse base URL, e.g. ``https://org.crm.dynamics.com``.
+            entity_set_name: Dataverse logical entity set name, e.g. ``accounts``.
+            token: Azure AD access token for the Dataverse resource.
+            select: Optional list of columns to return (``$select``).
+            filter: Optional OData filter expression (``$filter``), e.g.
+                ``"evt_loaddate ne null or evt_loadtype ne null"``.
+            page_size: Records per page, sent as ``Prefer: odata.maxpagesize``.
+            timeout: HTTP timeout in seconds.
+            session: Optional shared ``requests`` session.
+
+        Returns:
+            Dict with ``entity_set_name``, ``records`` (all pages, with
+            ``@odata.*`` annotation keys removed), ``row_count``,
+            ``page_count``, and ``timestamp`` (UTC ISO 8601).
+        """
+        logger = ToolkitLogger.get_logger("DynamicsCrmClient")
+        resolved_resource_url = Validation.require_non_empty(resource_url, "resource_url")
+        resolved_entity_set_name = Validation.require_non_empty(
+            entity_set_name, "entity_set_name"
+        )
+        Validation.require_non_empty(token, "token")
+        if (
+            not isinstance(page_size, int)
+            or isinstance(page_size, bool)
+            or page_size <= 0
+        ):
+            raise ValueError("page_size must be a positive integer")
+
+        http = session or requests
+        url: Optional[str] = (
+            f"{resolved_resource_url.rstrip('/')}/api/data/v9.2/"
+            f"{resolved_entity_set_name}"
+        )
+        query_options: dict[str, str] = {}
+        if select:
+            query_options["$select"] = ",".join(select)
+        if filter:
+            query_options["$filter"] = filter
+        if query_options:
+            # Encode spaces as %20 (not +) and keep $ and , readable for OData.
+            url += "?" + urlencode(query_options, quote_via=quote, safe="$,")
+
+        headers = DynamicsCrmClient.__build_auth_headers(token)
+        headers.update(
+            {
+                "Prefer": f"odata.maxpagesize={page_size}",
+                "OData-MaxVersion": "4.0",
+                "OData-Version": "4.0",
+            }
+        )
+
+        records: list[dict[str, Any]] = []
+        page_count = 0
+        while url:
+            response = http.get(url, headers=headers, timeout=timeout)
+            page_count += 1
+            if response.status_code != 200:
+                DynamicsCrmClient.__raise_update_error(
+                    f"Query entities {resolved_entity_set_name}", response
+                )
+
+            data = response.json()
+            for record in data.get("value", []):
+                records.append(
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if not key.startswith("@odata.")
+                    }
+                )
+
+            # nextLink is a full URL that already carries the query options.
+            url = data.get("@odata.nextLink")
+
+        logger.info(
+            "Read %d record(s) from %s in %d page(s)",
+            len(records),
+            resolved_entity_set_name,
+            page_count,
+        )
+
+        return {
+            "entity_set_name": resolved_entity_set_name,
+            "records": records,
+            "row_count": len(records),
+            "page_count": page_count,
+            "timestamp": Dates.utc_now().isoformat(),
         }
 
     @staticmethod

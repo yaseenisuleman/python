@@ -79,7 +79,7 @@ Public methods (all return `requests.Response`):
 
 ### dynamics_crm.py — `DynamicsCrmClient`
 
-Azure AD token acquisition and Dataverse (Dynamics 365) record updates.
+Azure AD token acquisition and Dataverse (Dynamics 365) record reads and updates.
 
 ```python
 from python_toolkit.api.dynamics_crm import DynamicsCrmClient
@@ -104,7 +104,18 @@ single_update = DynamicsCrmClient.update_entity(
     token=access_token,
 )
 
-# 3. Update many records in one UpdateMultiple request.
+# 3. Read records (every page is fetched automatically).
+query = DynamicsCrmClient.query_entities(
+    resource_url,
+    "accounts",
+    access_token,
+    select=["accountid", "name"],
+    filter="statecode eq 0 and name ne null",
+)
+for record in query["records"]:
+    print(record["accountid"], record["name"])
+
+# 4. Update many records in one UpdateMultiple request.
 bulk_update = DynamicsCrmClient.bulk_update_entities(
     resource_url=resource_url,
     entity_set_name="accounts",
@@ -126,10 +137,19 @@ Public methods — all accept keyword-only `timeout=30.0` and `session=None`:
 | Method | Returns |
 |--------|---------|
 | `get_access_token(tenant_id, client_id, client_secret, resource)` | `access_token`, `token_type`, `expires_in`, `ext_expires_in`, `expires_on`, `not_before`, `resource` |
+| `query_entities(resource_url, entity_set_name, token, *, select=None, filter=None, page_size=5000)` | `entity_set_name`, `records`, `row_count`, `page_count`, `timestamp` |
 | `update_entity(resource_url, entity_set_name, entity_id, field_values, token)` | `entity_set_name`, `entity_id`, `updated_fields`, `status_code` |
 | `bulk_update_entities(resource_url, entity_set_name, updates, token, *, entity_type_name=None, max_batch_size=1000)` | see below |
 
 `update_entity` raises `RuntimeError` (with the Dataverse error payload) on any status other than 200/204.
+
+**`query_entities` details**
+
+- GETs `{resource_url}/api/data/v9.2/{entity_set_name}` with `$select` (comma-joined) and `$filter` when given; both are URL-encoded (spaces as `%20`).
+- Sends `Prefer: odata.maxpagesize=<page_size>` and follows `@odata.nextLink` until there is none. `page_count` is the number of GET requests made.
+- Records are returned as Dataverse sends them, minus `@odata.*` annotation keys (e.g. `@odata.etag`).
+- Raises `RuntimeError` (with the Dataverse error payload) on any status other than 200, and `ValueError` if `page_size` is not a positive integer.
+- `timestamp` is the UTC time the query finished (ISO 8601).
 
 **`bulk_update_entities` details**
 
