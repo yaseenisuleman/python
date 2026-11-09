@@ -7,6 +7,7 @@ How to call the public methods in the `python_toolkit` package. Signatures and r
 ```text
 src/python_toolkit/
 ├── api/          client.py, dynamics_crm.py,     (extra: api)
+│                 dataverse_import.py,            (extras: api, sqlserver)
 │                 openobserve.py
 ├── cdc/          mssql.py                        (extra: cdc)
 ├── common/       dates.py, json.py, logging.py, validation.py
@@ -196,6 +197,68 @@ Public methods — all accept keyword-only `timeout=30.0` and `session=None`:
 | `error_count` | Records that failed |
 | `status_code` | `200` if all succeeded, `207` if any failed |
 | `errors` | List of `{entity_id, field_values, status_code, message}` — `message` is the short Microsoft error text |
+
+### dataverse_import.py — `DataverseImport`
+
+Imports a Dataverse entity set into SQL Server through a JSON staging table, page by page, so an import flow is a single call. Built on `DynamicsCrmClient.iter_entity_pages`, `SqlServerTransfer.records_to_json_staging` and `SqlServerTransfer.sql_sp_execute`. Needs both extras: `[api,sqlserver]`.
+
+```python
+from kestra import Kestra
+from python_toolkit.api.dataverse_import import DataverseImport
+
+# 1. Stage and merge each page of changed records before the next page is read.
+result = DataverseImport.import_entity(
+    dwh_conn, "https://paycorpcrmglimmeruat.crm4.dynamics.com", token, "accounts",
+    "[Data.Staging].[DS.CRM].[Imports.Account]",
+    "EXEC [DS.CRM].[Import].[Upsert.Account] %s, %s",
+    import_id=import_id, select=[...], filter="modifiedon ge 2026-11-09T10:00:00Z",
+    merge_params=[0],   # @ForceUpdate
+)
+Kestra.outputs({"pages": result["pages"], "row_count": result["row_count"], **result["merge_totals"]})
+# {"entity_set_name": "accounts", "import_id": "...", "pages": 3, "row_count": 12034,
+#  "merge_totals": {"RowsRead": 12034, "RowsInserted": 20, "RowsUpdated": 11990,
+#                   "RowsSkipped": 24, "RowsDuplicate": 0},
+#  "timestamp": "2026-11-09T10:05:00+00:00"}
+
+# 2. Stage every ID, then let the procedure flag records deleted in CRM.
+deletes = DataverseImport.check_entity_deletes(
+    dwh_conn, "https://paycorpcrmglimmeruat.crm4.dynamics.com", token, "accounts", "accountid",
+    "[Data.Staging].[DS.CRM].[Imports.Keys]",
+    "EXEC [DS.CRM].[Import].[Delete.Account] %s",
+    import_id=import_id,
+)
+Kestra.outputs({"keys_read": deletes["keys_read"], **deletes["result"]})
+# {"entity_set_name": "accounts", "import_id": "...", "pages": 3, "keys_read": 48211,
+#  "result": {...first row of the procedure's result...}, "timestamp": "..."}
+```
+
+Public methods — all accept keyword-only `import_id=None`, `page_size=5000`, `timeout=30.0` and `session=None`:
+
+| Method | Returns |
+|--------|---------|
+| `import_entity(conn_str, resource_url, token, entity_set_name, staging_table, merge_sql, *, select=None, filter=None, orderby=None, annotations=DynamicsCrmClient.CHOICE_AND_LOOKUP_ANNOTATIONS, merge_params=None)` | `entity_set_name`, `import_id`, `pages`, `row_count`, `merge_totals`, `timestamp` |
+| `check_entity_deletes(conn_str, resource_url, token, entity_set_name, key_column, staging_table, delete_sql)` | `entity_set_name`, `import_id`, `pages`, `keys_read`, `result`, `timestamp` |
+
+An empty `import_id` means a new UUID, returned so later tasks can use it; the same ID is used for every page. `timestamp` is the UTC time the call finished (ISO 8601). `pages` is the number of pages read, empty ones included.
+
+**`import_entity` details**
+
+- For each page from `iter_entity_pages` (with `select`, `filter`, `orderby`, `page_size`, `annotations`): an empty page is skipped; otherwise the page is staged with `records_to_json_staging(conn_str, records, staging_table, import_id=import_id)` and then merged with `sql_sp_execute(conn_str, merge_sql, params=[import_id, *merge_params], return_results=True)`, before the next page is read.
+- `merge_sql` gets `import_id` as its first `%s`, followed by `merge_params` (e.g. `[0]` for `@ForceUpdate`).
+- The merge must return one row of counts, e.g. `RowsRead, RowsInserted, RowsUpdated, RowsSkipped, RowsDuplicate`. Every numeric column of the first row (int, float or `Decimal`; not bit/bool) is added up over all pages into `merge_totals`; other columns are ignored. `sql_sp_execute` returns `decimal`/`numeric` values as strings, so return counts as `INT` (or `BIGINT`) for them to be summed.
+- A merge that returns no rows raises `RuntimeError` naming the page.
+- Errors are not caught. A failure on page N raises, and pages 1 to N-1 stay merged (the merge procedure clears its own staging rows).
+- With no records at all: `pages` is 1, `row_count` is 0 and `merge_totals` is `{}` — the merge is never run.
+- `ValueError` for an empty `merge_sql`, an empty or invalid `staging_table` (`SqlServer.validate_table_name`), or `merge_params` that is not a list; `iter_entity_pages` and `records_to_json_staging` validate the rest.
+- Logs one line per page (page number, records, the merge row) and a summary.
+
+**`check_entity_deletes` details**
+
+- Reads only `key_column` (`$select`), with no annotations, and stages each non-empty page with `records_to_json_staging`; each row's `Content` is `{"<key_column>": "<id>"}`.
+- After all pages are read, runs `sql_sp_execute(conn_str, delete_sql, params=import_id, return_results=True)` **once** — even when no IDs came back, since the procedure has its own safety check and logs why it flagged nothing.
+- If any page read fails, the error is raised before `delete_sql` runs, so a partial ID list never reaches the procedure.
+- `result` is the first row of the `delete_sql` result set, or `{}` if it returns none.
+- `ValueError` for an empty `key_column` or one with characters other than letters, digits and `_`, an empty `delete_sql`, or an empty or invalid `staging_table`.
 
 ### openobserve.py — `OpenObserve`
 
@@ -570,6 +633,7 @@ Keys that resolve outside the store folder (e.g. `../x`) raise `ValueError`.
 |--------|-------|-------|
 | `python_toolkit.api.client` | `ApiClient` | `api` |
 | `python_toolkit.api.dynamics_crm` | `DynamicsCrmClient` | `api` |
+| `python_toolkit.api.dataverse_import` | `DataverseImport` | `api`, `sqlserver` |
 | `python_toolkit.api.openobserve` | `OpenObserve` | `api` |
 | `python_toolkit.cdc.mssql` | `MssqlCdc` | `cdc` |
 | `python_toolkit.common.dates` | `Dates` | — |

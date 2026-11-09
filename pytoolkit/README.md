@@ -28,7 +28,7 @@ Core helpers have no third-party dependencies. Pick extras for the stacks you us
 
 | Extra | Installs | Needed for |
 |-------|----------|------------|
-| `api` | `requests` | `api.client`, `api.dynamics_crm`, `api.openobserve` |
+| `api` | `requests` | `api.client`, `api.dynamics_crm`, `api.openobserve`; `api.dataverse_import` with `sqlserver` |
 | `cdc` | `pymssql` | `cdc.mssql` |
 | `parquet` | `pyarrow` | `parquet.writer` |
 | `sqlserver` | `pymssql` | `sqlserver.sqlserver` (`connect`), `sqlserver.transfer` |
@@ -197,6 +197,33 @@ for page in DynamicsCrmClient.iter_entity_pages(
 
 `iter_entity_pages` yields one page at a time (retrying when Dataverse throttles), so each page is saved before the next is read. `records_to_json_staging` writes one row per record (`Content` as JSON, `DtAdded` = `GETDATE()`, `ImportId`) in one transaction.
 
+### Dynamics CRM in Kestra — import and delete check in one call each
+
+```python
+from kestra import Kestra
+from python_toolkit.api.dataverse_import import DataverseImport
+
+result = DataverseImport.import_entity(
+    dwh_conn, resource.rstrip("/"), token, "accounts",
+    "[Data.Staging].[DS.CRM].[Imports.Account]",
+    "EXEC [DS.CRM].[Import].[Upsert.Account] %s, %s",
+    import_id=import_id, select=["accountid", "name", "statecode"],
+    filter="modifiedon ge 2026-11-09T10:00:00Z",
+    merge_params=[0],   # @ForceUpdate
+)
+Kestra.outputs({"pages": result["pages"], "row_count": result["row_count"], **result["merge_totals"]})
+
+deletes = DataverseImport.check_entity_deletes(
+    dwh_conn, resource.rstrip("/"), token, "accounts", "accountid",
+    "[Data.Staging].[DS.CRM].[Imports.Keys]",
+    "EXEC [DS.CRM].[Import].[Delete.Account] %s",
+    import_id=import_id,
+)
+Kestra.outputs({"keys_read": deletes["keys_read"], **deletes["result"]})
+```
+
+`import_entity` stages each page and runs the merge (`import_id`, then `merge_params`) before the next page is read, adding up the numeric columns of each merge's first row into `merge_totals`. `check_entity_deletes` stages every ID, then runs the delete check once — only if every page was read. Install with `[api,sqlserver]`.
+
 ## Classes by module
 
 | Module | Class | Extra |
@@ -210,6 +237,7 @@ for page in DynamicsCrmClient.iter_entity_pages(
 | `python_toolkit.sqlserver.transfer` | `SqlServerTransfer` | `sqlserver` |
 | `python_toolkit.api.client` | `ApiClient` | `api` |
 | `python_toolkit.api.dynamics_crm` | `DynamicsCrmClient` | `api` |
+| `python_toolkit.api.dataverse_import` | `DataverseImport` | `api`, `sqlserver` |
 | `python_toolkit.api.openobserve` | `OpenObserve` | `api` |
 | `python_toolkit.parquet.writer` | `ParquetWriter` | `parquet` |
 | `python_toolkit.storage.object_store` | `LocalObjectStore` | — |
