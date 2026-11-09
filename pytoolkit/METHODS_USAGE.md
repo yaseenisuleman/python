@@ -115,7 +115,24 @@ query = DynamicsCrmClient.query_entities(
 for record in query["records"]:
     print(record["accountid"], record["name"])
 
-# 4. Update many records in one UpdateMultiple request.
+# 4. Read a large entity set one page at a time, saving each page before the next is read.
+for page in DynamicsCrmClient.iter_entity_pages(
+    resource_url,
+    "accounts",
+    access_token,
+    select=["accountid", "name", "statecode", "_ownerid_value"],
+    filter="modifiedon ge 2026-11-09T10:00:00Z",
+    orderby="modifiedon asc",
+    annotations=DynamicsCrmClient.CHOICE_AND_LOOKUP_ANNOTATIONS,  # choice labels, lookup tables
+):
+    save(page["records"])  # e.g. SqlServerTransfer.records_to_json_staging(...)
+# page: {"entity_set_name": "accounts", "page_number": 1, "records": [
+#          {"accountid": "...", "statecode": 0,
+#           "statecode@OData.Community.Display.V1.FormattedValue": "Active",
+#           "_ownerid_value@Microsoft.Dynamics.CRM.lookuplogicalname": "systemuser", ...}],
+#        "row_count": 5000, "timestamp": "..."}
+
+# 5. Update many records in one UpdateMultiple request.
 bulk_update = DynamicsCrmClient.bulk_update_entities(
     resource_url=resource_url,
     entity_set_name="accounts",
@@ -137,7 +154,8 @@ Public methods — all accept keyword-only `timeout=30.0` and `session=None`:
 | Method | Returns |
 |--------|---------|
 | `get_access_token(tenant_id, client_id, client_secret, resource)` | `access_token`, `token_type`, `expires_in`, `ext_expires_in`, `expires_on`, `not_before`, `resource` |
-| `query_entities(resource_url, entity_set_name, token, *, select=None, filter=None, page_size=5000)` | `entity_set_name`, `records`, `row_count`, `page_count`, `timestamp` |
+| `query_entities(resource_url, entity_set_name, token, *, select=None, filter=None, orderby=None, page_size=5000, annotations=None, max_retries=3)` | `entity_set_name`, `records`, `row_count`, `page_count`, `timestamp` |
+| `iter_entity_pages(resource_url, entity_set_name, token, *, select=None, filter=None, orderby=None, page_size=5000, annotations=None, max_retries=3)` | generator; one dict per page: `entity_set_name`, `page_number`, `records`, `row_count`, `timestamp` |
 | `update_entity(resource_url, entity_set_name, entity_id, field_values, token)` | `entity_set_name`, `entity_id`, `updated_fields`, `status_code` |
 | `bulk_update_entities(resource_url, entity_set_name, updates, token, *, entity_type_name=None, max_batch_size=1000)` | see below |
 
@@ -145,11 +163,20 @@ Public methods — all accept keyword-only `timeout=30.0` and `session=None`:
 
 **`query_entities` details**
 
-- GETs `{resource_url}/api/data/v9.2/{entity_set_name}` with `$select` (comma-joined) and `$filter` when given; both are URL-encoded (spaces as `%20`).
-- Sends `Prefer: odata.maxpagesize=<page_size>` and follows `@odata.nextLink` until there is none. `page_count` is the number of GET requests made.
-- Records are returned as Dataverse sends them, minus `@odata.*` annotation keys (e.g. `@odata.etag`).
-- Raises `RuntimeError` (with the Dataverse error payload) on any status other than 200, and `ValueError` if `page_size` is not a positive integer.
+- Reads every page with `iter_entity_pages` (same URL, headers, retries and errors — see below) and combines them into one `records` list in memory. `page_count` is the number of pages read.
 - `timestamp` is the UTC time the query finished (ISO 8601).
+- For large entity sets, use `iter_entity_pages` and save each page as it arrives.
+
+**`iter_entity_pages` details**
+
+- A generator: each page is requested only when the loop asks for it, so a page can be saved before the next is read. Inputs are validated when the method is called (`ValueError` for an empty URL, set name or token, a `page_size` that is not a positive integer, a `max_retries` that is not an integer ≥ 0, or `annotations` that is not a list of strings).
+- GETs `{resource_url}/api/data/v9.2/{entity_set_name}` with `$select` (comma-joined), `$filter` and `$orderby` when given; all are URL-encoded (spaces as `%20`).
+- Sends one `Prefer` header: `odata.maxpagesize=<page_size>`, plus `odata.include-annotations="<annotations, comma-joined>"` when `annotations` is given. `DynamicsCrmClient.CHOICE_AND_LOOKUP_ANNOTATIONS` asks for choice labels (`OData.Community.Display.V1.FormattedValue`) and lookup target tables (`Microsoft.Dynamics.CRM.lookuplogicalname`).
+- Follows `@odata.nextLink` until there is none. An empty result still yields one page, with `records == []` and `row_count == 0`.
+- Records are returned as Dataverse sends them, minus `@odata.*` keys (e.g. `@odata.etag`). Annotation keys such as `statecode@OData.Community.Display.V1.FormattedValue` and `_ownerid_value@Microsoft.Dynamics.CRM.lookuplogicalname` are kept.
+- Throttling: on 429 or 503 it waits for the `Retry-After` header (seconds; 5 s if absent) and retries the same page, up to `max_retries` times, then raises.
+- Raises `RuntimeError` (with the Dataverse error payload) on any other status than 200. Pages already yielded stay with the caller.
+- `timestamp` is the UTC time each page was read (ISO 8601).
 
 **`bulk_update_entities` details**
 
@@ -461,6 +488,21 @@ result = SqlServerTransfer.sql_sp_to_sql_table(
 # {"destination_table": "[ATM].[TerminalLoads]", "row_count": 1234,
 #  "process_guid": "...", "timestamp": "2026-10-14T09:30:00+00:00"}
 
+# Stage a list of dicts (e.g. a Dataverse page) as JSON, one row per record, then merge it.
+result = SqlServerTransfer.records_to_json_staging(
+    "{{ envs.sql_conn_staging }}",
+    page["records"],
+    "[Data.Staging].[DS.CRM].[Imports.Account]",
+    import_id=import_id,   # empty → a new UUID
+)
+# {"destination_table": "[Data.Staging].[DS.CRM].[Imports.Account]", "row_count": 5000,
+#  "import_id": "...", "timestamp": "2026-11-09T10:05:00+00:00"}
+SqlServerTransfer.sql_sp_execute(
+    "{{ envs.sql_conn_staging }}",
+    "EXEC [DS.CRM].[Import].[Upsert.Account] %s",
+    params=result["import_id"],
+)
+
 # Run a stored procedure and get its rows back as JSON records keyed by column name.
 result = SqlServerTransfer.sql_sp_to_json(
     "{{ envs.sql_conn_atm }}",
@@ -483,10 +525,13 @@ result = SqlServerTransfer.sql_sp_execute(
 | Method | Notes |
 |--------|-------|
 | `sql_sp_to_sql_table(source_conn_str, destination_conn_str, sql_query, destination_table, *, process_guid=None, batch_size=1000)` | Returns `destination_table`, `row_count`, `process_guid`, `timestamp` |
+| `records_to_json_staging(conn_str, records, destination_table, *, import_id=None, batch_size=500, content_column="Content", date_column="DtAdded", import_id_column="ImportId")` | Returns `destination_table`, `row_count`, `import_id`, `timestamp` |
 | `sql_sp_to_json(conn_str, sql_query, *, params=None, commit=True)` | Returns `records`, `row_count`, `columns`, `timestamp` |
 | `sql_sp_execute(conn_str, sql_query, *, params=None, return_results=False, commit=True, raise_on_error=True)` | Returns `success`, `sql_query`, `rows_affected`, `duration_seconds`, `timestamp`; plus `records`, `row_count`, `columns` with `return_results`; `success: False` and `error` on failure with `raise_on_error=False` |
 
 `sql_sp_to_sql_table` appends two columns to every row — the UTC load time, then `process_guid` — and inserts by position, so the destination table's columns must be the result set's columns followed by those two. Rows are streamed in batches of `batch_size`, inserted with multi-row `INSERT ... VALUES` statements of up to 1000 rows, and committed in one transaction. Connection strings can be `server=<host>;port=1433;user=<user>;password=<password>;database=<db>` or ODBC-style strings (see `connection_kwargs`). Datetime values are sent with millisecond precision.
+
+`records_to_json_staging` loads a list of dicts into a JSON staging table (the `[Data.Staging].[DS.<source>].[Imports.<Table>]` pattern, where a view reads `Content` with `OPENJSON` and a stored procedure merges it). Each record becomes one row: `Content` holds the record as JSON (`ensure_ascii=False`; dates and times as ISO 8601, `Decimal` and UUID values as strings), `DtAdded` is `GETDATE()` written into the SQL so the server sets it (it matches staging clean-ups that compare with `GETDATE()`), and `ImportId` is `import_id` (a new UUID when empty — returned so it can be passed to the merge procedure). Rows are inserted with named columns, `INSERT INTO <table> ([Content], [DtAdded], [ImportId]) VALUES (%s, GETDATE(), %s), ...`, `batch_size` rows per statement (1–1000, else `ValueError`), and all statements are committed in one transaction; any error rolls everything back and is raised. The column names can be changed (letters, digits and `_` only). With no records the database is not contacted and `row_count` is 0.
 
 `sql_sp_execute` is the general way to call a stored procedure. It reads the procedure to the end, so an error raised after earlier statements still fails the call, and it commits only when the whole procedure succeeded. By default it just runs and commits; pass `return_results=True` to also get the first result set as JSON-ready `records` (empty if the procedure returns none). `rows_affected` is the count SQL Server reports for the call, or `null` when it reports none — procedures with `SET NOCOUNT ON` report none, so for a reliable count have the procedure `SELECT @@ROWCOUNT AS RowsAffected` and use `return_results=True`. On failure it raises, or with `raise_on_error=False` rolls back and returns `success: False` with `error` (plus `sql_query`, `duration_seconds`, `timestamp`).
 

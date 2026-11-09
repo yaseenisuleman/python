@@ -173,6 +173,30 @@ Kestra.outputs({"row_count": result["row_count"], "timestamp": result["timestamp
 
 `query_entities` follows `@odata.nextLink` automatically and returns every page in `records`.
 
+### Dynamics CRM in Kestra — import page by page into a JSON staging table
+
+```python
+from python_toolkit.api.dynamics_crm import DynamicsCrmClient
+from python_toolkit.sqlserver.transfer import SqlServerTransfer
+
+for page in DynamicsCrmClient.iter_entity_pages(
+    resource.rstrip("/"),
+    "accounts",
+    token,
+    select=["accountid", "name", "statecode"],
+    filter="modifiedon ge 2026-11-09T10:00:00Z",
+    annotations=DynamicsCrmClient.CHOICE_AND_LOOKUP_ANNOTATIONS,
+):
+    SqlServerTransfer.records_to_json_staging(
+        "{{ envs.sql_conn_staging }}",
+        page["records"],
+        "[Data.Staging].[DS.CRM].[Imports.Account]",
+        import_id=import_id,
+    )
+```
+
+`iter_entity_pages` yields one page at a time (retrying when Dataverse throttles), so each page is saved before the next is read. `records_to_json_staging` writes one row per record (`Content` as JSON, `DtAdded` = `GETDATE()`, `ImportId`) in one transaction.
+
 ## Classes by module
 
 | Module | Class | Extra |
@@ -183,8 +207,10 @@ Kestra.outputs({"row_count": result["row_count"], "timestamp": result["timestamp
 | `python_toolkit.common.dates` | `Dates` | — |
 | `python_toolkit.cdc.mssql` | `MssqlCdc` | `cdc` |
 | `python_toolkit.sqlserver.sqlserver` | `SqlServer` | `sqlserver` |
+| `python_toolkit.sqlserver.transfer` | `SqlServerTransfer` | `sqlserver` |
 | `python_toolkit.api.client` | `ApiClient` | `api` |
 | `python_toolkit.api.dynamics_crm` | `DynamicsCrmClient` | `api` |
+| `python_toolkit.api.openobserve` | `OpenObserve` | `api` |
 | `python_toolkit.parquet.writer` | `ParquetWriter` | `parquet` |
 | `python_toolkit.storage.object_store` | `LocalObjectStore` | — |
 

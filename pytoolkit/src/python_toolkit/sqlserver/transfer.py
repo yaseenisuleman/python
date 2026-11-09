@@ -7,6 +7,8 @@ Kestra usage::
 
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -20,6 +22,8 @@ from python_toolkit.sqlserver.sqlserver import SqlServer
 # SQL Server allows at most 1000 rows in one INSERT ... VALUES statement.
 _MAX_ROWS_PER_INSERT = 1000
 
+_COLUMN_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
 
 def _json_value(value: Any) -> Any:
     """Convert a SQL value to a JSON-friendly Python value."""
@@ -30,6 +34,22 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, (Decimal, uuid.UUID)):
         return str(value)
     return value
+
+
+def _json_default(value: Any) -> Any:
+    """``json.dumps`` fallback: the ``_json_value`` conversions, else the usual ``TypeError``."""
+    converted = _json_value(value)
+    if converted is value:
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+    return converted
+
+
+def _column_name(column: str, name: str) -> str:
+    """Validate a column name (letters, digits and ``_``) and return it wrapped in ``[ ]``."""
+    column = Validation.require_non_empty(column, name)
+    if not _COLUMN_NAME_RE.fullmatch(column):
+        raise ValueError(f"{name} must contain only letters, numbers and underscores")
+    return f"[{column}]"
 
 
 def _param_values(params: Any) -> tuple[Any, ...]:
@@ -215,6 +235,83 @@ class SqlServerTransfer:
         if return_results:
             result.update(records=records, row_count=len(records), columns=columns or [])
         return result
+
+    @staticmethod
+    def records_to_json_staging(
+        conn_str: str,
+        records: list[dict[str, Any]],
+        destination_table: str,
+        *,
+        import_id: Optional[str] = None,
+        batch_size: int = 500,
+        content_column: str = "Content",
+        date_column: str = "DtAdded",
+        import_id_column: str = "ImportId",
+    ) -> dict[str, Any]:
+        """Insert records into a JSON staging table, one row per record.
+
+        Each row holds the record as JSON in ``content_column``, ``GETDATE()`` (set by
+        the server) in ``date_column`` and ``import_id`` (a new UUID when empty) in
+        ``import_id_column``. JSON values are made safe as in ``sql_sp_to_json``: dates
+        and times become ISO 8601 strings, ``Decimal`` and UUID values become strings.
+
+        Rows are inserted with named columns, ``batch_size`` rows (at most 1000) per
+        ``INSERT ... VALUES`` statement, and committed in one transaction; on error
+        everything is rolled back and the error is raised. With no records, the
+        database is not contacted.
+        """
+        destination_table = SqlServer.validate_table_name(destination_table, "destination_table")
+        columns = ", ".join(
+            [
+                _column_name(content_column, "content_column"),
+                _column_name(date_column, "date_column"),
+                _column_name(import_id_column, "import_id_column"),
+            ]
+        )
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or not 0 < batch_size <= _MAX_ROWS_PER_INSERT
+        ):
+            raise ValueError(f"batch_size must be between 1 and {_MAX_ROWS_PER_INSERT}")
+        if not isinstance(records, list):
+            raise ValueError("records must be a list of dicts")
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise ValueError(f"Record at index {index} must be a dict")
+
+        logger = ToolkitLogger.get_logger("SqlServerTransfer")
+        import_id = (import_id or "").strip() or str(uuid.uuid4())
+
+        if records:
+            rows = [
+                (json.dumps(record, ensure_ascii=False, default=_json_default), import_id)
+                for record in records
+            ]
+            with SqlServer.connect(conn_str) as conn:
+                cursor = conn.cursor()
+                try:
+                    for chunk in SqlServer.iter_batches(rows, batch_size):
+                        insert_sql = (
+                            f"INSERT INTO {destination_table} ({columns}) VALUES "
+                            + ", ".join(["(%s, GETDATE(), %s)"] * len(chunk))
+                        )
+                        cursor.execute(insert_sql, tuple(value for row in chunk for value in row))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    cursor.close()
+
+        logger.info(f"Inserted {len(records)} rows into {destination_table} (import {import_id})")
+
+        return {
+            "destination_table": destination_table,
+            "row_count": len(records),
+            "import_id": import_id,
+            "timestamp": Dates.utc_now().isoformat(),
+        }
 
     @staticmethod
     def _run_sql(

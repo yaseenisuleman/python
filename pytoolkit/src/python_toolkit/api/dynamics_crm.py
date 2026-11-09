@@ -11,8 +11,8 @@ Kestra usage::
         "{{ inputs.resource }}",
     )
 
-Reads (``query_entities``) and updates (``update_entity``,
-``bulk_update_entities``) Dataverse records.
+Reads (``query_entities``, or page by page with ``iter_entity_pages``) and
+updates (``update_entity``, ``bulk_update_entities``) Dataverse records.
 
 Uses the Azure AD v1 OAuth 2.0 client credentials grant
 (``https://login.microsoftonline.com/{tenant_id}/oauth2/token``) against a
@@ -20,7 +20,8 @@ Dynamics ``resource`` URL, e.g. ``https://org.crm.dynamics.com/``.
 """
 
 from __future__ import annotations
-from typing import Any, Optional
+import time
+from typing import Any, Iterator, Optional
 from urllib.parse import quote, urlencode
 import requests
 
@@ -32,9 +33,19 @@ __all__ = ["DynamicsCrmClient"]
 
 _TOKEN_PATH = "oauth2/token"
 
+# Statuses Dataverse uses for service protection limits (throttling); the request is retried.
+_THROTTLE_STATUSES = (429, 503)
+_DEFAULT_RETRY_AFTER_SECONDS = 5.0
+
 
 class DynamicsCrmClient:
     """Client for the Dynamics 365 / Dataverse Web API."""
+
+    # Choice labels and lookup target table names, for ``annotations=``.
+    CHOICE_AND_LOOKUP_ANNOTATIONS = [
+        "OData.Community.Display.V1.FormattedValue",
+        "Microsoft.Dynamics.CRM.lookuplogicalname",
+    ]
 
     @staticmethod
     def __build_auth_headers(token: str) -> dict[str, str]:
@@ -192,39 +203,61 @@ class DynamicsCrmClient:
         }
 
     @staticmethod
-    def query_entities(
+    def __retry_after_seconds(response: requests.Response) -> float:
+        """Seconds to wait from a ``Retry-After`` header, or the default when absent or not a number."""
+        try:
+            seconds = float(response.headers.get("Retry-After"))
+        except (TypeError, ValueError):
+            return _DEFAULT_RETRY_AFTER_SECONDS
+        return seconds if seconds >= 0 else _DEFAULT_RETRY_AFTER_SECONDS
+
+    @staticmethod
+    def iter_entity_pages(
         resource_url: str,
         entity_set_name: str,
         token: str,
         *,
         select: Optional[list[str]] = None,
         filter: Optional[str] = None,
+        orderby: Optional[str] = None,
         page_size: int = 5000,
+        annotations: Optional[list[str]] = None,
+        max_retries: int = 3,
         timeout: float = 30.0,
         session: Optional[requests.Session] = None,
-    ) -> dict[str, Any]:
-        """Read Dataverse records from an entity set, following every result page.
+    ) -> Iterator[dict[str, Any]]:
+        """Read Dataverse records from an entity set one page at a time.
 
-        Paging is automatic: each response's ``@odata.nextLink`` is followed
-        until Dataverse returns no further link, and all pages are combined.
+        A generator: each page is requested only when the previous one has been
+        consumed, so callers can save a page before the next is read. Follows
+        ``@odata.nextLink`` until Dataverse returns no further link. An empty result
+        still yields one page (with no records).
+
+        Inputs are validated when this method is called, before the first page is read.
 
         Args:
             resource_url: Dataverse base URL, e.g. ``https://org.crm.dynamics.com``.
             entity_set_name: Dataverse logical entity set name, e.g. ``accounts``.
             token: Azure AD access token for the Dataverse resource.
             select: Optional list of columns to return (``$select``).
-            filter: Optional OData filter expression (``$filter``), e.g.
-                ``"evt_loaddate ne null or evt_loadtype ne null"``.
+            filter: Optional OData filter expression (``$filter``).
+            orderby: Optional OData sort expression (``$orderby``), e.g.
+                ``"modifiedon asc"``.
             page_size: Records per page, sent as ``Prefer: odata.maxpagesize``.
+            annotations: Optional annotation names to request with
+                ``Prefer: odata.include-annotations``, e.g.
+                ``DynamicsCrmClient.CHOICE_AND_LOOKUP_ANNOTATIONS``.
+            max_retries: Retries per page when Dataverse throttles (429 or 503),
+                each after waiting for ``Retry-After`` (5 s if absent).
             timeout: HTTP timeout in seconds.
             session: Optional shared ``requests`` session.
 
-        Returns:
-            Dict with ``entity_set_name``, ``records`` (all pages, with
-            ``@odata.*`` annotation keys removed), ``row_count``,
-            ``page_count``, and ``timestamp`` (UTC ISO 8601).
+        Yields:
+            Dict per page with ``entity_set_name``, ``page_number`` (1-based),
+            ``records`` (with ``@odata.*`` keys removed; annotation keys such as
+            ``name@OData.Community.Display.V1.FormattedValue`` are kept),
+            ``row_count``, and ``timestamp`` (UTC ISO 8601).
         """
-        logger = ToolkitLogger.get_logger("DynamicsCrmClient")
         resolved_resource_url = Validation.require_non_empty(resource_url, "resource_url")
         resolved_entity_set_name = Validation.require_non_empty(
             entity_set_name, "entity_set_name"
@@ -236,9 +269,19 @@ class DynamicsCrmClient:
             or page_size <= 0
         ):
             raise ValueError("page_size must be a positive integer")
+        if (
+            not isinstance(max_retries, int)
+            or isinstance(max_retries, bool)
+            or max_retries < 0
+        ):
+            raise ValueError("max_retries must be an integer of 0 or more")
+        if annotations is not None and (
+            not isinstance(annotations, (list, tuple))
+            or not all(isinstance(name, str) and name.strip() for name in annotations)
+        ):
+            raise ValueError("annotations must be a list of non-empty strings")
 
-        http = session or requests
-        url: Optional[str] = (
+        url = (
             f"{resolved_resource_url.rstrip('/')}/api/data/v9.2/"
             f"{resolved_entity_set_name}"
         )
@@ -247,41 +290,159 @@ class DynamicsCrmClient:
             query_options["$select"] = ",".join(select)
         if filter:
             query_options["$filter"] = filter
+        if orderby:
+            query_options["$orderby"] = orderby
         if query_options:
             # Encode spaces as %20 (not +) and keep $ and , readable for OData.
             url += "?" + urlencode(query_options, quote_via=quote, safe="$,")
 
+        prefer = f"odata.maxpagesize={page_size}"
+        if annotations:
+            prefer += f',odata.include-annotations="{",".join(annotations)}"'
+
         headers = DynamicsCrmClient.__build_auth_headers(token)
         headers.update(
             {
-                "Prefer": f"odata.maxpagesize={page_size}",
+                "Prefer": prefer,
                 "OData-MaxVersion": "4.0",
                 "OData-Version": "4.0",
             }
         )
 
-        records: list[dict[str, Any]] = []
-        page_count = 0
-        while url:
-            response = http.get(url, headers=headers, timeout=timeout)
-            page_count += 1
+        return DynamicsCrmClient.__read_pages(
+            session or requests,
+            url,
+            headers,
+            resolved_entity_set_name,
+            max_retries,
+            timeout,
+        )
+
+    @staticmethod
+    def __read_pages(
+        http: Any,
+        url: str,
+        headers: dict[str, str],
+        entity_set_name: str,
+        max_retries: int,
+        timeout: float,
+    ) -> Iterator[dict[str, Any]]:
+        """Generator behind ``iter_entity_pages`` (kept separate so inputs are validated eagerly)."""
+        logger = ToolkitLogger.get_logger("DynamicsCrmClient")
+        next_url: Optional[str] = url
+        page_number = 0
+
+        while next_url:
+            page_number += 1
+            retries = 0
+            while True:
+                response = http.get(next_url, headers=headers, timeout=timeout)
+                if response.status_code not in _THROTTLE_STATUSES or retries >= max_retries:
+                    break
+                retries += 1
+                wait_seconds = DynamicsCrmClient.__retry_after_seconds(response)
+                logger.warning(
+                    "Dataverse returned %d for %s page %d; retry %d of %d in %.1f s",
+                    response.status_code,
+                    entity_set_name,
+                    page_number,
+                    retries,
+                    max_retries,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+
             if response.status_code != 200:
                 DynamicsCrmClient.__raise_update_error(
-                    f"Query entities {resolved_entity_set_name}", response
+                    f"Query entities {entity_set_name}", response
                 )
 
             data = response.json()
-            for record in data.get("value", []):
-                records.append(
-                    {
-                        key: value
-                        for key, value in record.items()
-                        if not key.startswith("@odata.")
-                    }
-                )
-
+            records = [
+                {
+                    key: value
+                    for key, value in record.items()
+                    if not key.startswith("@odata.")
+                }
+                for record in data.get("value", [])
+            ]
             # nextLink is a full URL that already carries the query options.
-            url = data.get("@odata.nextLink")
+            next_url = data.get("@odata.nextLink")
+
+            logger.info(
+                "Read page %d of %s: %d record(s)", page_number, entity_set_name, len(records)
+            )
+            yield {
+                "entity_set_name": entity_set_name,
+                "page_number": page_number,
+                "records": records,
+                "row_count": len(records),
+                "timestamp": Dates.utc_now().isoformat(),
+            }
+
+    @staticmethod
+    def query_entities(
+        resource_url: str,
+        entity_set_name: str,
+        token: str,
+        *,
+        select: Optional[list[str]] = None,
+        filter: Optional[str] = None,
+        orderby: Optional[str] = None,
+        page_size: int = 5000,
+        annotations: Optional[list[str]] = None,
+        max_retries: int = 3,
+        timeout: float = 30.0,
+        session: Optional[requests.Session] = None,
+    ) -> dict[str, Any]:
+        """Read Dataverse records from an entity set, following every result page.
+
+        Paging is automatic: each response's ``@odata.nextLink`` is followed
+        until Dataverse returns no further link, and all pages are combined.
+        To process large results page by page, use ``iter_entity_pages``.
+
+        Args:
+            resource_url: Dataverse base URL, e.g. ``https://org.crm.dynamics.com``.
+            entity_set_name: Dataverse logical entity set name, e.g. ``accounts``.
+            token: Azure AD access token for the Dataverse resource.
+            select: Optional list of columns to return (``$select``).
+            filter: Optional OData filter expression (``$filter``), e.g.
+                ``"evt_loaddate ne null or evt_loadtype ne null"``.
+            orderby: Optional OData sort expression (``$orderby``).
+            page_size: Records per page, sent as ``Prefer: odata.maxpagesize``.
+            annotations: Optional annotation names to request with
+                ``Prefer: odata.include-annotations``.
+            max_retries: Retries per page when Dataverse throttles (429 or 503).
+            timeout: HTTP timeout in seconds.
+            session: Optional shared ``requests`` session.
+
+        Returns:
+            Dict with ``entity_set_name``, ``records`` (all pages, with
+            ``@odata.*`` annotation keys removed), ``row_count``,
+            ``page_count``, and ``timestamp`` (UTC ISO 8601).
+        """
+        logger = ToolkitLogger.get_logger("DynamicsCrmClient")
+        pages = DynamicsCrmClient.iter_entity_pages(
+            resource_url,
+            entity_set_name,
+            token,
+            select=select,
+            filter=filter,
+            orderby=orderby,
+            page_size=page_size,
+            annotations=annotations,
+            max_retries=max_retries,
+            timeout=timeout,
+            session=session,
+        )
+
+        records: list[dict[str, Any]] = []
+        page_count = 0
+        resolved_entity_set_name = entity_set_name
+        for page in pages:
+            page_count = page["page_number"]
+            resolved_entity_set_name = page["entity_set_name"]
+            records.extend(page["records"])
 
         logger.info(
             "Read %d record(s) from %s in %d page(s)",
