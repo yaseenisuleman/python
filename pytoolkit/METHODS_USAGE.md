@@ -538,6 +538,7 @@ Methods that take `connection_or_cursor` accept either; a cursor they create the
 Moves data between SQL Server databases, using `SqlServer.connect` (same `pymssql` requirement).
 
 ```python
+from python_toolkit.sqlserver.sqlserver import SqlServer
 from python_toolkit.sqlserver.transfer import SqlServerTransfer
 
 # Run a stored procedure on one database and load its rows into a table on another.
@@ -550,6 +551,19 @@ result = SqlServerTransfer.sql_sp_to_sql_table(
 )
 # {"destination_table": "[ATM].[TerminalLoads]", "row_count": 1234,
 #  "process_guid": "...", "timestamp": "2026-10-14T09:30:00+00:00"}
+
+# Read a procedure once and write the same rows to several tables (one call per destination).
+with SqlServer.connect("{{ envs.sql_conn_atm }}") as conn:
+    rows = SqlServer.fetch_all(conn, "EXEC [DW].[GetLoadInformation] NULL, NULL")
+for conn_str in ["{{ envs.sql_conn_staging_a }}", "{{ envs.sql_conn_staging_b }}"]:
+    result = SqlServerTransfer.records_to_sql_table(
+        conn_str,
+        rows,                                       # dicts (values in column order) or tuples
+        "[ATM].[TerminalLoads]",
+        process_guid="{{ inputs.process_guid }}",   # empty → a new UUID
+    )
+# {"destination_table": "[ATM].[TerminalLoads]", "row_count": 1234,
+#  "process_guid": "...", "timestamp": "..."}
 
 # Stage a list of dicts (e.g. a Dataverse page) as JSON, one row per record, then merge it.
 result = SqlServerTransfer.records_to_json_staging(
@@ -588,11 +602,14 @@ result = SqlServerTransfer.sql_sp_execute(
 | Method | Notes |
 |--------|-------|
 | `sql_sp_to_sql_table(source_conn_str, destination_conn_str, sql_query, destination_table, *, process_guid=None, batch_size=1000)` | Returns `destination_table`, `row_count`, `process_guid`, `timestamp` |
+| `records_to_sql_table(conn_str, records, destination_table, *, process_guid=None, batch_size=1000)` | Returns `destination_table`, `row_count`, `process_guid`, `timestamp` |
 | `records_to_json_staging(conn_str, records, destination_table, *, import_id=None, batch_size=500, content_column="Content", date_column="DtAdded", import_id_column="ImportId")` | Returns `destination_table`, `row_count`, `import_id`, `timestamp` |
 | `sql_sp_to_json(conn_str, sql_query, *, params=None, commit=True)` | Returns `records`, `row_count`, `columns`, `timestamp` |
 | `sql_sp_execute(conn_str, sql_query, *, params=None, return_results=False, commit=True, raise_on_error=True)` | Returns `success`, `sql_query`, `rows_affected`, `duration_seconds`, `timestamp`; plus `records`, `row_count`, `columns` with `return_results`; `success: False` and `error` on failure with `raise_on_error=False` |
 
 `sql_sp_to_sql_table` appends two columns to every row — the UTC load time, then `process_guid` — and inserts by position, so the destination table's columns must be the result set's columns followed by those two. Rows are streamed in batches of `batch_size`, inserted with multi-row `INSERT ... VALUES` statements of up to 1000 rows, and committed in one transaction. Connection strings can be `server=<host>;port=1433;user=<user>;password=<password>;database=<db>` or ODBC-style strings (see `connection_kwargs`). Datetime values are sent with millisecond precision.
+
+`records_to_sql_table` writes rows that are already in memory the same way as `sql_sp_to_sql_table` (both use one insert helper): the same two trailing columns, positional `INSERT INTO <table> VALUES ...` of up to 1000 rows per statement, one transaction, rolled back and raised on any error. Use it to read a source once (e.g. with `SqlServer.fetch_all`) and write the rows to several destinations. A record is a dict, whose values are used in insertion order (the result-set column order from `fetch_all`), or a list/tuple. `batch_size` (> 0) is how many records are sent at a time, as with `sql_sp_to_sql_table`'s `fetchmany`. Pass the same `process_guid` to every call if the destinations should share it; when it is empty each call makes its own. With no records the database is not contacted and `row_count` is 0.
 
 `records_to_json_staging` loads a list of dicts into a JSON staging table (the `[Data.Staging].[DS.<source>].[Imports.<Table>]` pattern, where a view reads `Content` with `OPENJSON` and a stored procedure merges it). Each record becomes one row: `Content` holds the record as JSON (`ensure_ascii=False`; dates and times as ISO 8601, `Decimal` and UUID values as strings), `DtAdded` is `GETDATE()` written into the SQL so the server sets it (it matches staging clean-ups that compare with `GETDATE()`), and `ImportId` is `import_id` (a new UUID when empty — returned so it can be passed to the merge procedure). Rows are inserted with named columns, `INSERT INTO <table> ([Content], [DtAdded], [ImportId]) VALUES (%s, GETDATE(), %s), ...`, `batch_size` rows per statement (1–1000, else `ValueError`), and all statements are committed in one transaction; any error rolls everything back and is raised. The column names can be changed (letters, digits and `_` only). With no records the database is not contacted and `row_count` is 0.
 

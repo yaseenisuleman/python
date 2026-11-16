@@ -12,6 +12,7 @@ import re
 import uuid
 from datetime import date, datetime, time
 from decimal import Decimal
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional
 
 from python_toolkit.common.dates import Dates
@@ -59,6 +60,36 @@ def _param_values(params: Any) -> tuple[Any, ...]:
     return (params,)
 
 
+def _insert_rows(
+    cursor: Any,
+    destination_table: str,
+    rows: Sequence[Sequence[Any]],
+    date_created: datetime,
+    process_guid: str,
+) -> int:
+    """Insert rows positionally, each followed by ``date_created`` and ``process_guid``.
+
+    Sends multi-row ``INSERT INTO <table> VALUES (...), ...`` statements of up to
+    ``_MAX_ROWS_PER_INSERT`` rows. Does not commit; returns the number of rows inserted.
+    """
+    batch = [(*row, date_created, process_guid) for row in rows]
+    for chunk in SqlServer.iter_batches(batch, _MAX_ROWS_PER_INSERT):
+        insert_sql = f"INSERT INTO {destination_table} VALUES " + ", ".join(
+            "(" + ", ".join(["%s"] * len(row)) + ")" for row in chunk
+        )
+        cursor.execute(insert_sql, tuple(value for row in chunk for value in row))
+    return len(batch)
+
+
+def _record_values(record: Any, index: int) -> tuple[Any, ...]:
+    """Return a record's values: a mapping's values in order, or a list/tuple as-is."""
+    if isinstance(record, Mapping):
+        return tuple(record.values())
+    if isinstance(record, Sequence) and not isinstance(record, (str, bytes, bytearray)):
+        return tuple(record)
+    raise ValueError(f"Record at index {index} must be a dict, list or tuple")
+
+
 class SqlServerTransfer:
     """Move data between SQL Server databases."""
 
@@ -96,29 +127,79 @@ class SqlServerTransfer:
             dest_cursor = dest_conn.cursor()
             try:
                 source_cursor.execute(sql_query)
-                row_placeholders = None
 
                 while True:
                     rows = source_cursor.fetchmany(batch_size)
                     if not rows:
                         break
 
-                    batch = [(*row, date_created, process_guid) for row in rows]
-                    if row_placeholders is None:
-                        row_placeholders = "(" + ", ".join(["%s"] * len(batch[0])) + ")"
-
-                    for chunk in SqlServer.iter_batches(batch, _MAX_ROWS_PER_INSERT):
-                        insert_sql = (
-                            f"INSERT INTO {destination_table} VALUES "
-                            + ", ".join([row_placeholders] * len(chunk))
-                        )
-                        dest_cursor.execute(insert_sql, tuple(value for row in chunk for value in row))
-                    row_count += len(batch)
+                    row_count += _insert_rows(
+                        dest_cursor, destination_table, rows, date_created, process_guid
+                    )
 
                 dest_conn.commit()
+            except Exception:
+                dest_conn.rollback()
+                raise
             finally:
                 source_cursor.close()
                 dest_cursor.close()
+
+        logger.info(f"Inserted {row_count} rows into {destination_table}")
+
+        return {
+            "destination_table": destination_table,
+            "row_count": row_count,
+            "process_guid": process_guid,
+            "timestamp": Dates.utc_now().isoformat(),
+        }
+
+    @staticmethod
+    def records_to_sql_table(
+        conn_str: str,
+        records: Sequence[Mapping[str, Any] | Sequence[Any]],
+        destination_table: str,
+        *,
+        process_guid: Optional[str] = None,
+        batch_size: int = 1000,
+    ) -> dict[str, Any]:
+        """Insert records already in memory into a table, as ``sql_sp_to_sql_table`` does.
+
+        A record is a dict (its values are used in insertion order) or a list/tuple, e.g.
+        the rows from ``SqlServer.fetch_all``. Each row gets two trailing columns: the UTC
+        load time and ``process_guid`` (a new UUID when empty). The insert is positional,
+        so the destination table's columns must be the record's columns followed by those
+        two. Rows are sent ``batch_size`` at a time as multi-row ``INSERT ... VALUES``
+        statements of up to 1000 rows and committed in one transaction; on error
+        everything is rolled back and the error is raised. With no records, the database
+        is not contacted.
+        """
+        destination_table = SqlServer.validate_table_name(destination_table, "destination_table")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+        if isinstance(records, (str, bytes, bytearray, Mapping)) or not isinstance(records, Sequence):
+            raise ValueError("records must be a list of dicts, lists or tuples")
+        rows = [_record_values(record, index) for index, record in enumerate(records)]
+
+        logger = ToolkitLogger.get_logger("SqlServerTransfer")
+        process_guid = (process_guid or "").strip() or str(uuid.uuid4())
+        date_created = Dates.utc_now().replace(tzinfo=None)
+        row_count = 0
+
+        if rows:
+            with SqlServer.connect(conn_str) as conn:
+                cursor = conn.cursor()
+                try:
+                    for batch in SqlServer.iter_batches(rows, batch_size):
+                        row_count += _insert_rows(
+                            cursor, destination_table, batch, date_created, process_guid
+                        )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    cursor.close()
 
         logger.info(f"Inserted {row_count} rows into {destination_table}")
 

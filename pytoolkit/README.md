@@ -173,6 +173,23 @@ Kestra.outputs({"row_count": result["row_count"], "timestamp": result["timestamp
 
 `query_entities` follows `@odata.nextLink` automatically and returns every page in `records`.
 
+### SQL Server in Kestra — read once, write to several tables
+
+```python
+from python_toolkit.sqlserver.sqlserver import SqlServer
+from python_toolkit.sqlserver.transfer import SqlServerTransfer
+
+with SqlServer.connect("{{ envs.sql_conn_source }}") as conn:
+    rows = SqlServer.fetch_all(conn, "EXEC [DW].[GetLoadInformation] NULL, NULL")
+
+for conn_str in ["{{ envs.sql_conn_a }}", "{{ envs.sql_conn_b }}", "{{ envs.sql_conn_c }}"]:
+    SqlServerTransfer.records_to_sql_table(
+        conn_str, rows, "[Staging].[TerminalLoads]", process_guid=process_guid
+    )
+```
+
+`records_to_sql_table` inserts rows the same way as `sql_sp_to_sql_table` (each row plus the UTC load time and `process_guid`, positional multi-row inserts, one transaction), but from records already in memory, so the source is read only once.
+
 ### Dynamics CRM in Kestra — import page by page into a JSON staging table
 
 ```python
