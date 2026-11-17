@@ -12,9 +12,9 @@ dependencies = []
 
 [project.optional-dependencies]
 api = ["requests"]
-cdc = ["pymssql"]
+cdc = ["pymssql>=2.4.5"]
 parquet = ["pyarrow"]
-sqlserver = ["pymssql"]
+sqlserver = ["pymssql>=2.4.5"]
 all = ["pytoolkit-package[api,cdc,parquet,sqlserver]"]
 
 [tool.hatch.version]

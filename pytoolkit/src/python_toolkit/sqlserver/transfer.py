@@ -12,7 +12,7 @@ import re
 import uuid
 from datetime import date, datetime, time
 from decimal import Decimal
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, Optional
 
 from python_toolkit.common.dates import Dates
@@ -81,6 +81,93 @@ def _insert_rows(
     return len(batch)
 
 
+def _bulk_value(value: Any) -> Any:
+    """Convert a value pymssql's bulk copy cannot bind into one it can.
+
+    Bulk copy binds by Python type and accepts ``str``, ``int``, ``float``, ``bool``,
+    ``Decimal``, ``datetime``, ``bytes``/``bytearray`` and ``None``. A ``uuid.UUID`` becomes
+    its string, a ``date`` or ``time`` its ISO string, and a ``memoryview`` ``bytes``;
+    SQL Server converts them to the column's type.
+    """
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, memoryview):
+        return bytes(value)
+    return value
+
+
+def _bulk_copy_rows(
+    conn: Any,
+    destination_table: str,
+    rows: Iterable[Sequence[Any]],
+    date_created: datetime,
+    process_guid: str,
+    batch_size: int,
+) -> int:
+    """Bulk copy rows positionally, each followed by ``date_created`` and ``process_guid``.
+
+    Uses pymssql's ``Connection.bulk_copy`` (one ``INSERT BULK`` stream, ``batch_size``
+    rows per batch). ``rows`` may be any iterable; it is read once, as it is sent.
+    Does not commit; returns the number of rows sent.
+    """
+    row_count = 0
+
+    def elements() -> Iterator[tuple[Any, ...]]:
+        nonlocal row_count
+        for row in rows:
+            row_count += 1
+            yield (*(_bulk_value(value) for value in row), date_created, process_guid)
+
+    conn.bulk_copy(destination_table, elements(), batch_size=batch_size)
+    return row_count
+
+
+def _rollback_quietly(conn: Any, logger: Any) -> None:
+    """Roll back, logging (not raising) a failure, so the original error is the one raised."""
+    try:
+        conn.rollback()
+    except Exception as exc:  # the connection may be unusable after a failed bulk copy
+        logger.warning(f"Rollback after failed bulk copy also failed: {type(exc).__name__}: {exc}")
+
+
+def _delete_process_rows(
+    conn_str: str,
+    destination_table: str,
+    process_id_column: str,
+    process_guid: str,
+    logger: Any,
+) -> None:
+    """After a failed bulk copy, delete any rows it left behind, on a new connection.
+
+    Logs (does not raise) a failure, so the caller can re-raise the original error.
+    """
+    try:
+        with SqlServer.connect(conn_str) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"DELETE FROM {destination_table} WHERE {process_id_column} = %s",
+                    (process_guid,),
+                )
+                deleted = cursor.rowcount
+                conn.commit()
+            finally:
+                cursor.close()
+        logger.warning(
+            f"Bulk copy failed; deleted {deleted} rows from {destination_table} "
+            f"where {process_id_column} = {process_guid}"
+        )
+    except Exception as exc:
+        logger.error(
+            f"Bulk copy failed and the cleanup delete from {destination_table} "
+            f"(process {process_guid}) also failed: {type(exc).__name__}: {exc}"
+        )
+
+
 def _record_values(record: Any, index: int) -> tuple[Any, ...]:
     """Return a record's values: a mapping's values in order, or a list/tuple as-is."""
     if isinstance(record, Mapping):
@@ -102,6 +189,8 @@ class SqlServerTransfer:
         *,
         process_guid: Optional[str] = None,
         batch_size: int = 1000,
+        bulk_copy: bool = False,
+        process_id_column: Optional[str] = "ProcessId",
     ) -> dict[str, Any]:
         """Run a stored procedure (or query) on the source and insert its rows into a table.
 
@@ -110,16 +199,63 @@ class SqlServerTransfer:
         table's columns must match the query's columns followed by those two.
         Rows are streamed in batches and committed in a single transaction. Each batch is
         sent as multi-row ``INSERT ... VALUES`` statements of up to 1000 rows.
+
+        With ``bulk_copy=True`` the rows are streamed into the table with pymssql's bulk
+        copy (``INSERT BULK``, ``batch_size`` rows per batch) instead, which is much faster
+        for wide tables or many rows; see ``records_to_sql_table`` for how a failure is
+        cleaned up with ``process_id_column``.
         """
         Validation.require_non_empty(sql_query, "sql_query")
         destination_table = SqlServer.validate_table_name(destination_table, "destination_table")
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than 0")
+        if bulk_copy and process_id_column is not None:
+            process_id_column = _column_name(process_id_column, "process_id_column")
 
         logger = ToolkitLogger.get_logger("SqlServerTransfer")
         process_guid = (process_guid or "").strip() or str(uuid.uuid4())
         date_created = Dates.utc_now().replace(tzinfo=None)
         row_count = 0
+
+        if bulk_copy:
+            try:
+                with SqlServer.connect(source_conn_str) as source_conn, \
+                        SqlServer.connect(destination_conn_str) as dest_conn:
+                    source_cursor = source_conn.cursor()
+                    try:
+                        source_cursor.execute(sql_query)
+
+                        def source_rows() -> Iterator[Sequence[Any]]:
+                            while True:
+                                rows = source_cursor.fetchmany(batch_size)
+                                if not rows:
+                                    return
+                                yield from rows
+
+                        row_count = _bulk_copy_rows(
+                            dest_conn, destination_table, source_rows(),
+                            date_created, process_guid, batch_size,
+                        )
+                        dest_conn.commit()
+                    except Exception:
+                        _rollback_quietly(dest_conn, logger)
+                        raise
+                    finally:
+                        source_cursor.close()
+            except Exception:
+                if process_id_column is not None:
+                    _delete_process_rows(
+                        destination_conn_str, destination_table, process_id_column, process_guid, logger
+                    )
+                raise
+
+            logger.info(f"Inserted {row_count} rows into {destination_table}")
+            return {
+                "destination_table": destination_table,
+                "row_count": row_count,
+                "process_guid": process_guid,
+                "timestamp": Dates.utc_now().isoformat(),
+            }
 
         with SqlServer.connect(source_conn_str) as source_conn, \
                 SqlServer.connect(destination_conn_str) as dest_conn:
@@ -162,6 +298,8 @@ class SqlServerTransfer:
         *,
         process_guid: Optional[str] = None,
         batch_size: int = 1000,
+        bulk_copy: bool = False,
+        process_id_column: Optional[str] = "ProcessId",
     ) -> dict[str, Any]:
         """Insert records already in memory into a table, as ``sql_sp_to_sql_table`` does.
 
@@ -173,12 +311,25 @@ class SqlServerTransfer:
         statements of up to 1000 rows and committed in one transaction; on error
         everything is rolled back and the error is raised. With no records, the database
         is not contacted.
+
+        With ``bulk_copy=True`` the rows are loaded with pymssql's bulk copy
+        (``Connection.bulk_copy``: one ``INSERT BULK`` stream, ``batch_size`` rows per
+        batch) instead of ``INSERT ... VALUES``, which is much faster for wide tables or
+        many rows. Requires pymssql 2.4.5+ for ``nvarchar`` text to arrive intact. Same row
+        shape and commit: pymssql keeps a transaction open, so the load is committed once at
+        the end and rolled back on error. As a safeguard, if the load fails, rows whose
+        ``process_id_column`` (default ``ProcessId``; letters, digits and ``_``) equals
+        ``process_guid`` are then deleted on a new connection before the error is raised,
+        so ``process_guid`` must be unique to this load. Pass ``process_id_column=None``
+        to skip that delete.
         """
         destination_table = SqlServer.validate_table_name(destination_table, "destination_table")
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than 0")
         if isinstance(records, (str, bytes, bytearray, Mapping)) or not isinstance(records, Sequence):
             raise ValueError("records must be a list of dicts, lists or tuples")
+        if bulk_copy and process_id_column is not None:
+            process_id_column = _column_name(process_id_column, "process_id_column")
         rows = [_record_values(record, index) for index, record in enumerate(records)]
 
         logger = ToolkitLogger.get_logger("SqlServerTransfer")
@@ -186,7 +337,24 @@ class SqlServerTransfer:
         date_created = Dates.utc_now().replace(tzinfo=None)
         row_count = 0
 
-        if rows:
+        if rows and bulk_copy:
+            try:
+                with SqlServer.connect(conn_str) as conn:
+                    try:
+                        row_count = _bulk_copy_rows(
+                            conn, destination_table, rows, date_created, process_guid, batch_size
+                        )
+                        conn.commit()
+                    except Exception:
+                        _rollback_quietly(conn, logger)
+                        raise
+            except Exception:
+                if process_id_column is not None:
+                    _delete_process_rows(
+                        conn_str, destination_table, process_id_column, process_guid, logger
+                    )
+                raise
+        elif rows:
             with SqlServer.connect(conn_str) as conn:
                 cursor = conn.cursor()
                 try:

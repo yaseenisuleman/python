@@ -29,9 +29,9 @@ Core helpers have no third-party dependencies. Pick extras for the stacks you us
 | Extra | Installs | Needed for |
 |-------|----------|------------|
 | `api` | `requests` | `api.client`, `api.dynamics_crm`, `api.openobserve`; `api.dataverse_import` with `sqlserver` |
-| `cdc` | `pymssql` | `cdc.mssql` |
+| `cdc` | `pymssql>=2.4.5` | `cdc.mssql` |
 | `parquet` | `pyarrow` | `parquet.writer` |
-| `sqlserver` | `pymssql` | `sqlserver.sqlserver` (`connect`), `sqlserver.transfer` |
+| `sqlserver` | `pymssql>=2.4.5` | `sqlserver.sqlserver` (`connect`), `sqlserver.transfer` |
 | `all` | all of the above | — |
 
 From a git tag:
@@ -184,11 +184,14 @@ with SqlServer.connect("{{ envs.sql_conn_source }}") as conn:
 
 for conn_str in ["{{ envs.sql_conn_a }}", "{{ envs.sql_conn_b }}", "{{ envs.sql_conn_c }}"]:
     SqlServerTransfer.records_to_sql_table(
-        conn_str, rows, "[Staging].[TerminalLoads]", process_guid=process_guid
+        conn_str, rows, "[Staging].[TerminalLoads]", process_guid=process_guid,
+        bulk_copy=True,   # optional; much faster for wide tables / many rows
     )
 ```
 
 `records_to_sql_table` inserts rows the same way as `sql_sp_to_sql_table` (each row plus the UTC load time and `process_guid`, positional multi-row inserts, one transaction), but from records already in memory, so the source is read only once.
+
+With `bulk_copy=True` (both methods) rows are loaded with pymssql's bulk copy instead of `INSERT ... VALUES`. Use it for wide tables or many rows. It needs pymssql 2.4.5+ for `nvarchar` text. It has the same row shape, return value and single transaction. If the load fails, rows where `process_id_column` (default `ProcessId`) equals `process_guid` are also deleted, so use a GUID unique to the load. Pass `process_id_column=None` to skip that. See `METHODS_USAGE.md` for the details.
 
 ### Dynamics CRM in Kestra — import page by page into a JSON staging table
 
